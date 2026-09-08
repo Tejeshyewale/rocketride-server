@@ -7,8 +7,8 @@ run-name: Experimental release ${{ inputs.ref }} → -${{ inputs.tag_suffix }}
 # publish a GitHub Release (with binaries attached) under a custom tag
 # suffix so workshop attendees can `gh release download` from it.
 #
-# Distinct from nightly.yaml/release.yaml because:
-#   - nightly.yaml hard-codes the `-prerelease` suffix and its
+# Distinct from prerelease.yaml/release.yaml because:
+#   - prerelease.yaml hard-codes the `-prerelease` suffix and its
 #     `cleanup-prereleases` step would wipe develop's current
 #     prerelease tags if run from another branch.
 #   - release.yaml has no suffix and auto-publishes to
@@ -138,17 +138,26 @@ jobs:
       - name: List artifacts
         run: find release-assets -type f | sort
 
-      # Tag push goes through WORKFLOW_PAT for the same reason _release.yaml
-      # uses it: GITHUB_TOKEN is refused on tags whose target commits touch
-      # files under .github/workflows/. Force-push so re-running this
-      # workflow on the same branch + tag_suffix replaces cleanly.
+      # Tag push goes through a short-lived GitHub App installation token for
+      # the same reason _release.yaml uses one: GITHUB_TOKEN is refused on
+      # tags whose target commits touch files under .github/workflows/, and
+      # the release-bot App has Contents:write + Workflows:write. Force-push
+      # so re-running this workflow on the same branch + tag_suffix replaces
+      # cleanly.
+      - name: Generate release-bot token
+        id: bot_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+
       - name: Create / replace tag
         env:
-          WORKFLOW_PAT: ${{ secrets.WORKFLOW_PAT }}
+          BOT_TOKEN: ${{ steps.bot_token.outputs.token }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git remote set-url origin "https://x-access-token:${WORKFLOW_PAT}@github.com/${GITHUB_REPOSITORY}.git"
+          git remote set-url origin "https://x-access-token:${BOT_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git tag -f "${{ matrix.tag_name }}"
           git push -f origin "${{ matrix.tag_name }}"
 
@@ -169,3 +178,41 @@ jobs:
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Publish the engine container too, under the run's own suffix.
+  #
+  # WHY THIS EXISTS. Until now the only workflows that produced an engine
+  # container were prerelease.yaml (auto, develop) and release.yaml (full
+  # release, publishes to npm/PyPI/Marketplace). So there was NO way to get a
+  # branch build into the cloud: the first overwrites the shared
+  # `<version>-prerelease` tag that every other build resolves to, and the
+  # second publishes to the public registries. Both are wrong for a workshop
+  # or hotfix branch, which left "put this branch in front of users" with no
+  # safe route at all.
+  #
+  # With tag_suffix the image lands on `<version>-<suffix>` and nothing else —
+  # `latest` is skipped by _docker.yaml. Nothing shared is touched, so this
+  # cannot disturb develop's pipeline.
+  #
+  # Only when the run actually includes the server; a vscode-only workshop
+  # build has no engine to publish.
+  docker:
+    name: Docker
+    if: ${{ contains(inputs.products, 'server') }}
+    needs: [init, build]
+    uses: ./.github/workflows/_docker.yaml
+    permissions:
+      contents: read
+      packages: write
+      # id-token: write is REQUIRED even though nothing here signs directly —
+      # _docker.yaml's job declares it for cosign keyless signing, and GitHub
+      # validates at workflow start that the caller covers every permission the
+      # reusable job declares. Omitting it fails the whole run before any step
+      # executes (that is what broke every nightly after #929).
+      id-token: write
+    with:
+      ref: ${{ inputs.ref }}
+      server_version: ${{ needs.init.outputs.server_version }}
+      tag_suffix: ${{ inputs.tag_suffix }}
+    secrets: inherit
+

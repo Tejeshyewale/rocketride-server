@@ -33,6 +33,8 @@ _ENV_ATTR_MAP = {
     'ACCESS_KEY': 'accessKey',
     'APIKEY': 'apikey',
     'KEY': 'apikey',
+    'KEY_ID': 'apiKeyId',
+    'KEY_SECRET': 'apiKeySecret',
     'REGION': 'region',
     'HOST': 'host',
     'PORT': 'port',
@@ -126,9 +128,18 @@ _LLM_MOCK_CREDENTIALS = {
     'llm_openai_api': {'apikey': 'sk-mock-placeholder-for-tests', 'model': 'mock-model'},
     'llm_gmi_cloud': {'apikey': 'sk-mock-placeholder-for-tests'},
     'llm_qwen': {'apikey': 'sk-mock-placeholder-for-tests'},
+    'llm_minimax': {'apikey': 'sk-mock-placeholder-for-tests'},
+    'llm_baidu_qianfan': {'apikey': 'mock-baidu-qianfan-placeholder-for-tests'},
     'llm_vision_ollama': {'apikey': 'sk-mock-placeholder-for-tests'},
     'rerank_cohere': {'apikey': 'mock-cohere-placeholder-for-tests'},
+    'tool_apify': {'apikey': 'mock-apify-placeholder-for-tests'},
+    'tool_daytona': {'apikey': 'mock-daytona-placeholder-for-tests'},
     'tool_exa_search': {'apikey': 'mock-exa-search-placeholder-for-tests'},
+    'tool_tavily': {'apikey': 'mock-tavily-placeholder-for-tests'},
+    'tool_crustdata': {'apikey': 'mock-crustdata-placeholder-for-tests'},
+    'tool_deepl': {'apikey': 'mock-deepl-placeholder-for-tests'},
+    'tool_slack': {'token': 'xoxb-mock-placeholder-for-tests'},
+    'tool_notion': {'apikey': 'secret_mock-notion-placeholder-for-tests'},
 }
 
 
@@ -173,6 +184,9 @@ class PipelineBuilder:
         config = {}
         if profile:
             config['profile'] = profile
+
+        if provider == self.config.provider and self.config.config:
+            config.update(self.config.config)
         # Inject credentials into the pipeline config.
         #
         # `ROCKETRIDE_MOCK` (set by the test runner) and per-group

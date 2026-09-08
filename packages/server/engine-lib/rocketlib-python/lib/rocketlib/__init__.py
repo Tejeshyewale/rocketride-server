@@ -32,6 +32,7 @@ from .engine import error
 from .engine import expand
 from .engine import getServiceDefinition
 from .engine import getServiceDefinitions
+from .engine import getTask
 from .engine import getVersion
 from .engine import isAppMonitor
 from .engine import isLevelEnabled
@@ -60,14 +61,6 @@ from .filters import IServiceEndpoint
 from .filters import IServiceFilterPipe
 from .filters import ILoader
 from .filters import invoke_function
-from .filters import normalize_tool_input
-from .filters import optional_bool
-from .filters import optional_int
-from .filters import optional_str
-from .filters import require_bool
-from .filters import require_int
-from .filters import require_str
-from .filters import validate_tool_input_schema
 from .filters import tool_function
 from .filters import ToolDescriptor
 from .types import AVI_ACTION
@@ -89,6 +82,10 @@ from .types import OPEN_MODE
 from .types import PROTOCOL_CAPS
 from .types import SERVICE_MODE
 from .types import TAG, TAG_ID
+from .paths import DEFAULT_MAX_COMPONENT
+from .paths import extended_length_path
+from .paths import shorten_path_component
+from .paths import shorten_path_components
 
 from engLib import Filters
 
@@ -99,17 +96,20 @@ __all__ = [
     'AVI_ACTION',
     'configureLogger',
     'debug',
+    'DEFAULT_MAX_COMPONENT',
     'Ec',
     'error',
     'Entry',
     'ENDPOINT_MODE',
     'error',
     'expand',
+    'extended_length_path',
     'Filters',
     'FLAGS',
     'getObject',
     'getServiceDefinition',
     'getServiceDefinitions',
+    'getTask',
     'getVersion',
     'IControl',
     'IDict',
@@ -138,23 +138,17 @@ __all__ = [
     'monitorSSE',
     'monitorStatus',
     'monitorDependencyDownload',
-    'normalize_tool_input',
     'OPEN_MODE',
-    'optional_bool',
-    'optional_int',
-    'optional_str',
     'outputEndpointParameters',
     'outputEntry',
     'outputException',
     'outputField',
     'processArguments',
     'readLine',
-    'require_bool',
-    'require_int',
-    'require_str',
-    'validate_tool_input_schema',
     'PROTOCOL_CAPS',
     'SERVICE_MODE',
+    'shorten_path_component',
+    'shorten_path_components',
     'TAG',
     'TAG_ID',
     'tool_function',

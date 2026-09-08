@@ -25,18 +25,19 @@ import React, { useState, useRef, useMemo, useCallback, CSSProperties } from 're
 import { useMessaging } from '../hooks/useMessaging';
 import { ConnectionSettings } from './ConnectionSettings';
 import { PipelineSettings } from './PipelineSettings';
-import { DebuggingSettings } from './DebuggingSettings';
 // EnvVariablesSettings removed — env is now managed in the Account page
 import { IntegrationSettings } from './IntegrationSettings';
 import { DeploySettings } from './DeploySettings';
 import { MessageDisplay } from './MessageDisplay';
-import { commonStyles } from 'shared/themes/styles';
-import { TabPanel } from 'shared/components/tab-panel/TabPanel';
-import type { ITabPanelTab, ITabPanelPanel } from 'shared/components/tab-panel/TabPanel';
+import { commonStyles } from 'shell';
+import type { CheckoutPlan } from 'shell';
+import type { ViewMenu } from 'shell';
+import { TabPanel } from 'shell';
+import type { ITabPanelPanel } from 'shell';
 import type { ServiceStatus, DockerStatus, VersionOption } from '../components/panels/shared';
 
-import 'shared/themes/rocketride-default.css';
-import 'shared/themes/rocketride-vscode.css';
+import 'shell/themes/rocketride-default.css';
+import '../../../themes/rocketride-vscode.css';
 import '../../styles/root.css';
 
 // ============================================================================
@@ -59,13 +60,9 @@ export interface ConnectionGroupSettings {
 	hasApiKey: boolean;
 	/** User-entered API key (cleared after save to secret storage). */
 	apiKey: string;
-	/** Selected team ID for cloud mode multi-tenant deployments. */
-	teamId: string;
 	/** Local engine settings (applies to local mode only). */
 	local: {
 		engineVersion: string;
-		debugOutput: boolean;
-		engineArgs: string;
 	};
 }
 
@@ -77,6 +74,14 @@ export interface SettingsData {
 	defaultPipelinePath: string;
 	/** How pipelines behave after file changes: auto-restart, manual, or prompt the user. */
 	pipelineRestartBehavior: 'auto' | 'manual' | 'prompt';
+	/** Default idle-timeout (seconds) for runs without a per-pipeline override; 0 = no timeout. */
+	pipelineTtl: number;
+	/** Default trace verbosity for runs without a per-pipeline override. */
+	pipelineTraceLevel: 'none' | 'metadata' | 'summary' | 'full';
+	/** Additional command-line arguments passed to each pipeline task via `.use`. */
+	taskArguments: string;
+	/** Enable full debug output for pipeline tasks (--trace=debugOut via `.use` args). */
+	pipelineDebugOutput: boolean;
 	envVars?: Record<string, string>;
 	/** Auto-install RocketRide docs for detected coding agents. */
 	autoAgentIntegration: boolean;
@@ -110,6 +115,7 @@ export type SettingsIncomingMessage =
 	| {
 			type: 'settingsLoaded';
 			settings: SettingsData;
+			isSubscribed?: boolean;
 	  }
 	| {
 			type: 'showMessage';
@@ -121,6 +127,10 @@ export type SettingsIncomingMessage =
 	| {
 			type: 'versionsLoaded';
 			versions: EngineVersionItem[];
+	  }
+	| {
+			type: 'subscriptionStatus';
+			isSubscribed: boolean;
 	  };
 
 /** Messages this webview sends **to** the extension host. */
@@ -144,7 +154,7 @@ export type SettingsOutgoingMessage =
 			type: 'fetchVersions';
 	  }
 	| {
-			type: 'fetchTeams';
+			type: 'openSubscribe';
 	  };
 
 // ============================================================================
@@ -231,43 +241,194 @@ export const settingsStyles = {
 		marginBottom: 8,
 		lineHeight: 1.4,
 	} as CSSProperties,
+	// Per-page header — names the page the user is on (matches the browser
+	// settings page's section head). Sits at the top of each flat page body.
+	pageHeader: {
+		display: 'flex',
+		alignItems: 'baseline',
+		gap: 8,
+	} as CSSProperties,
+	pageTitle: {
+		margin: 0,
+		fontSize: 17,
+		fontWeight: 500,
+		color: 'var(--rr-text-primary)',
+	} as CSSProperties,
+	// Flat page column — stacks header, description, and controls with a uniform
+	// gap (replaces the old card body now that pages are card-less).
+	pageBody: {
+		display: 'flex',
+		flexDirection: 'column',
+		gap: 16,
+	} as CSSProperties,
 };
 
 // ============================================================================
-// SHARED CARD HEADER WITH SAVE BUTTON
+// SUBSCRIBE BANNER STYLES
+// ============================================================================
+
+const subscribeBannerStyles = {
+	container: {
+		background: 'var(--rr-color-warning-bg, rgba(255, 193, 7, 0.1))',
+		borderBottom: '1px solid var(--rr-color-warning, #ffc107)',
+		padding: '10px 16px',
+	} as CSSProperties,
+	content: {
+		display: 'flex',
+		alignItems: 'center',
+		justifyContent: 'space-between',
+		gap: 12,
+	} as CSSProperties,
+	text: {
+		fontSize: 13,
+		color: 'var(--rr-text-primary)',
+		flex: 1,
+	} as CSSProperties,
+	button: {
+		...commonStyles.buttonPrimary,
+		whiteSpace: 'nowrap',
+		flexShrink: 0,
+	} as CSSProperties,
+};
+
+// ============================================================================
+// AUTH ERROR BANNER STYLES
+// ============================================================================
+
+// ============================================================================
+// PAGE BODY STYLE
 // ============================================================================
 
 /**
- * Card header with title + conditional Save/Cancel buttons.
- * Buttons only render when `dirty` is true (user has unsaved edits).
- * A brief "Saved" confirmation appears after a successful save.
+ * Fills the space to the right of the left settings nav; TabPanel's
+ * 100%-height wrapper resolves against this definite flex box.
  */
-export const SettingsCardHeader: React.FC<{
-	title: string;
-	onSave: () => void;
-	onCancel?: () => void;
-	dirty?: boolean;
-	saved?: boolean;
-}> = ({ title, onSave, onCancel, dirty, saved }) => (
-	<div style={settingsStyles.cardHeader}>
-		{title}
-		<div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-			{saved && <span style={{ fontSize: 11, color: 'var(--rr-color-success)' }}>Saved</span>}
-			{dirty && (
-				<>
-					{onCancel && (
-						<button style={{ ...commonStyles.buttonSecondary, ...commonStyles.cardHeaderButton } as CSSProperties} onClick={onCancel}>
-							Cancel
-						</button>
-					)}
-					<button style={{ ...commonStyles.buttonPrimary, ...commonStyles.cardHeaderButton } as CSSProperties} onClick={onSave}>
-						Save All Settings
-					</button>
-				</>
-			)}
-		</div>
-	</div>
-);
+const pageBodyStyle: CSSProperties = {
+	display: 'flex',
+	flexDirection: 'column',
+	flex: 1,
+	minWidth: 0,
+	minHeight: 0,
+};
+
+// ============================================================================
+// SETTINGS NAV STYLES — left-hand section menu (replaces the top pill strip)
+// ============================================================================
+
+/**
+ * Left-hand settings navigation, matching the browser settings page
+ * (shell SettingsProvider): a fixed-width rail of `listRow` pills, one per
+ * section, with the page bodies rendered to its right. The pages themselves
+ * are unchanged — only the section selector moved from a top strip to here.
+ */
+const settingsNavStyles = {
+	// Horizontal split: fixed nav column on the left, page bodies on the right.
+	body: {
+		display: 'flex',
+		flex: 1,
+		minWidth: 0,
+		minHeight: 0,
+		overflow: 'hidden',
+	} as CSSProperties,
+	// Fixed-width nav rail with its own scroll and a right divider.
+	sidebar: {
+		width: 200,
+		flexShrink: 0,
+		borderRight: '1px solid var(--rr-border)',
+		overflowY: 'auto',
+		padding: '12px 8px',
+		backgroundColor: 'var(--rr-bg-surface-alt)',
+	} as CSSProperties,
+	// One nav row — the shared listRow pill plus the button reset + active weight.
+	navItem: (active: boolean): CSSProperties => ({
+		...commonStyles.listRow(active),
+		width: '100%',
+		margin: '1px 0',
+		border: 'none',
+		textAlign: 'left',
+		fontWeight: active ? 600 : 400,
+		fontFamily: 'var(--rr-font-family)',
+	}),
+};
+
+// ============================================================================
+// TITLE BAR STYLES — page title + one-line description at the very top
+// ============================================================================
+
+/**
+ * Top-of-page title bar, mirroring the browser settings page's ContentHeader
+ * (24px title + 14px muted subtitle). Fixed height above the nav/body split.
+ */
+const settingsHeaderStyles = {
+	container: {
+		flex: 'none',
+		padding: '24px 24px 16px',
+	} as CSSProperties,
+	title: {
+		margin: 0,
+		fontSize: 24,
+		fontWeight: 700,
+		letterSpacing: '-0.01em',
+		color: 'var(--rr-text-primary)',
+	} as CSSProperties,
+	subtitle: {
+		marginTop: 4,
+		fontSize: 14,
+		fontWeight: 400,
+		color: 'var(--rr-text-secondary)',
+	} as CSSProperties,
+};
+
+// ============================================================================
+// FOOTER STYLES — Save/Cancel action row (mirrors DetailPanel's footer)
+// ============================================================================
+
+/**
+ * Bottom action row, matching DetailPanel's footer: a top-divided, right-
+ * aligned Save/Cancel pair. Rendered only while there are unsaved edits — the
+ * settings surface is "always editing", so the footer is the change affordance.
+ */
+const settingsFooterStyles = {
+	bar: {
+		flex: 'none',
+		display: 'flex',
+		alignItems: 'center',
+		justifyContent: 'flex-end',
+		gap: 8,
+		padding: '12px 20px',
+		borderTop: '1px solid var(--rr-border)',
+		background: 'var(--rr-bg-default)',
+	} as CSSProperties,
+	cancel: { ...commonStyles.buttonSecondary } as CSSProperties,
+	save: { ...commonStyles.buttonPrimary } as CSSProperties,
+};
+
+const authErrorBannerStyles = {
+	container: {
+		background: 'var(--vscode-inputValidation-errorBackground, rgba(255, 0, 0, 0.1))',
+		borderBottom: '1px solid var(--vscode-inputValidation-errorBorder, #be1100)',
+		padding: '10px 16px',
+	} as CSSProperties,
+	content: {
+		display: 'flex',
+		alignItems: 'center',
+		gap: 10,
+	} as CSSProperties,
+	text: {
+		fontSize: 13,
+		color: 'var(--vscode-errorForeground, #f44336)',
+		flex: 1,
+	} as CSSProperties,
+	dismiss: {
+		background: 'none',
+		border: 'none',
+		color: 'var(--vscode-errorForeground, #f44336)',
+		cursor: 'pointer',
+		fontSize: 14,
+		padding: '2px 6px',
+		flexShrink: 0,
+	} as CSSProperties,
+};
 
 // ============================================================================
 // MAIN SETTINGS VIEW COMPONENT
@@ -283,7 +444,7 @@ export const SettingsCardHeader: React.FC<{
  * - Connection settings with cloud/local mode support
  * - Pipeline configuration with default paths
  * - Local engine settings for self-hosted instances
- * - Debugging configuration options
+ * - Pipeline execution defaults (restart behavior, idle timeout, trace level)
  * - Real-time validation and feedback messaging
  */
 export const Settings: React.FC = () => {
@@ -297,19 +458,22 @@ export const Settings: React.FC = () => {
 			hostUrl: 'http://localhost:5565',
 			hasApiKey: false,
 			apiKey: '',
-			teamId: '',
-			local: { engineVersion: 'latest', debugOutput: false, engineArgs: '' },
+			local: { engineVersion: 'latest' },
 		},
 		deployment: {
 			connectionMode: null,
 			hostUrl: '',
 			hasApiKey: false,
 			apiKey: '',
-			teamId: '',
-			local: { engineVersion: 'latest', debugOutput: false, engineArgs: '' },
+			local: { engineVersion: 'latest' },
 		},
 		defaultPipelinePath: 'pipelines',
 		pipelineRestartBehavior: 'prompt',
+		pipelineTtl: 900,
+		// Must match package.json's rocketride.pipelineTraceLevel default.
+		pipelineTraceLevel: 'full',
+		taskArguments: '',
+		pipelineDebugOutput: false,
 		envVars: {},
 		autoAgentIntegration: true,
 		integrationCopilot: false,
@@ -330,8 +494,16 @@ export const Settings: React.FC = () => {
 
 	// Cloud auth state
 	const [cloudSignedIn, setCloudSignedIn] = useState(false);
+	// Subscription state — defaults to false so the subscribe button shows until the host confirms
+	const [subscribed, setSubscribed] = useState(false);
 	const [cloudUserName, setCloudUserName] = useState('');
-	const [teams, setTeams] = useState<Array<{ id: string; name: string }>>([]);
+
+	// Checkout modal state
+	const checkoutResolvers = useRef<{
+		plans?: { resolve: (v: CheckoutPlan[]) => void; reject: (e: Error) => void };
+		session?: { resolve: (v: { clientSecret: string; subscriptionId: string }) => void; reject: (e: Error) => void };
+		confirm?: { resolve: () => void; reject: (e: Error) => void };
+	}>({});
 
 	// Docker state
 	const [dockerStatus, setDockerStatus] = useState<DockerStatus>({ state: 'not-installed', version: null, publishedAt: null, imageTag: null });
@@ -352,12 +524,14 @@ export const Settings: React.FC = () => {
 	const [sudoPromptVisible, setSudoPromptVisible] = useState(false);
 	const [sudoPasswordInput, setSudoPasswordInput] = useState('');
 
+	// Auth error banner — shown when the settings page opens due to an auth failure
+	const [authError, setAuthError] = useState<string | null>(null);
+
 	// Active settings tab
 	const [activeTab, setActiveTab] = useState('development');
 
-	// Dirty-state tracking — buttons only appear when user has edited something
+	// Dirty-state tracking — the footer Save/Cancel appear only when the user has edited something
 	const [dirty, setDirty] = useState(false);
-	const [saved, setSaved] = useState(false);
 	const savedSettingsRef = useRef<SettingsData | null>(null);
 	const pendingSaveSnapshotRef = useRef<SettingsData | null>(null);
 
@@ -373,6 +547,10 @@ export const Settings: React.FC = () => {
 					// Deep-clone for cancel/reset so future edits don't mutate the snapshot
 					savedSettingsRef.current = JSON.parse(JSON.stringify(message.settings));
 					setDirty(false);
+					// Subscription status is included in the settingsLoaded payload
+					if (message.isSubscribed !== undefined) {
+						setSubscribed(message.isSubscribed);
+					}
 					// Pre-fetch versions from GitHub (cached on backend, shared across all modes)
 					setEngineVersionsLoading(true);
 					sendMessage({ type: 'fetchVersions' });
@@ -390,12 +568,45 @@ export const Settings: React.FC = () => {
 					setCloudUserName((message as any).userName || '');
 					break;
 
-				case 'teamsLoaded' as any:
-					setTeams((message as any).teams || []);
+				case 'subscriptionStatus':
+					setSubscribed(message.isSubscribed);
 					break;
+
+				// -- Checkout flow responses ------------------------------------
+				case 'checkout:plansResult' as any: {
+					const r = checkoutResolvers.current.plans;
+					if (r) {
+						checkoutResolvers.current.plans = undefined;
+						if ((message as any).error) r.reject(new Error((message as any).error));
+						else r.resolve((message as any).plans ?? []);
+					}
+					break;
+				}
+				case 'checkout:sessionResult' as any: {
+					const r = checkoutResolvers.current.session;
+					if (r) {
+						checkoutResolvers.current.session = undefined;
+						if ((message as any).error) r.reject(new Error((message as any).error));
+						else r.resolve({ clientSecret: (message as any).clientSecret, subscriptionId: (message as any).subscriptionId });
+					}
+					break;
+				}
+				case 'checkout:confirmResult' as any: {
+					const r = checkoutResolvers.current.confirm;
+					if (r) {
+						checkoutResolvers.current.confirm = undefined;
+						if ((message as any).error) r.reject(new Error((message as any).error));
+						else r.resolve();
+					}
+					break;
+				}
 
 				case 'setFocus' as any:
 					if ((message as any).focus) setActiveTab((message as any).focus);
+					break;
+
+				case 'authError' as any:
+					setAuthError((message as any).message || 'Authentication failed');
 					break;
 
 				case 'serverInfo' as any: {
@@ -419,11 +630,9 @@ export const Settings: React.FC = () => {
 						// On successful save acknowledgement: update the saved snapshot
 						// so Cancel reverts to the newly saved values
 						if (message.level === 'success' && message.context === 'save') {
-							savedSettingsRef.current = pendingSaveSnapshotRef.current ?? JSON.parse(JSON.stringify(settings)) as SettingsData;
+							savedSettingsRef.current = pendingSaveSnapshotRef.current ?? (JSON.parse(JSON.stringify(settings)) as SettingsData);
 							pendingSaveSnapshotRef.current = null;
 							setDirty(false);
-							setSaved(true);
-							setTimeout(() => setSaved(false), 5000);
 						}
 					}
 					break;
@@ -471,11 +680,13 @@ export const Settings: React.FC = () => {
 					// 'test' commands display results inline via testMessage
 					// rather than resetting engine busy state
 					if (command === 'test') {
-						const msg: MessageData = success
-							? { level: 'success', message: 'Connection successful!' }
-							: { level: 'error', message: error || 'Connection failed' };
+						const msg: MessageData = success ? { level: 'success', message: 'Connection successful!' } : { level: 'error', message: error || 'Connection failed' };
 						setTestMessage(msg);
-						if (success) setTimeout(() => setTestMessage(null), 5000);
+						// Clear the auth error banner on successful test connection
+						if (success) {
+							setAuthError(null);
+							setTimeout(() => setTestMessage(null), 5000);
+						}
 						break;
 					}
 
@@ -494,7 +705,6 @@ export const Settings: React.FC = () => {
 					}
 					break;
 				}
-
 			}
 		},
 	});
@@ -518,7 +728,6 @@ export const Settings: React.FC = () => {
 			setSettings(JSON.parse(JSON.stringify(savedSettingsRef.current)));
 		}
 		setDirty(false);
-		setSaved(false);
 	}, []);
 
 	/**
@@ -536,10 +745,6 @@ export const Settings: React.FC = () => {
 	const handleProbeCloudServer = (cloudUrl: string): void => {
 		setIsSaasProbed(undefined); // reset to loading
 		sendMessage({ type: 'probeServerInfo', hostUrl: cloudUrl } as any);
-	};
-
-	const handleFetchTeams = (cloudUrl: string): void => {
-		sendMessage({ type: 'fetchTeams', hostUrl: cloudUrl } as any);
 	};
 
 	/**
@@ -564,7 +769,6 @@ export const Settings: React.FC = () => {
 	 */
 	const handleSettingsChange = (changes: Partial<SettingsData>): void => {
 		setDirty(true);
-		setSaved(false);
 		// Clear stale test results when the user switches mode —
 		// previous test output is no longer relevant to the new mode
 		if (changes.development?.connectionMode || changes.deployment?.connectionMode) {
@@ -602,8 +806,6 @@ export const Settings: React.FC = () => {
 			if ((devMode && needsVersions.includes(devMode)) || (depMode && needsVersions.includes(depMode))) {
 				sendMessage({ type: 'fetchVersions' });
 			}
-
-			// Teams are fetched by CloudPanel after it confirms the server is SaaS
 
 			return next;
 		});
@@ -649,7 +851,6 @@ export const Settings: React.FC = () => {
 	const makeDockerHandler = (actionType: 'install' | 'update' | 'remove' | 'start' | 'stop') => makeEngineHandler('docker', actionType);
 	const makeServiceHandler = (actionType: 'install' | 'update' | 'remove' | 'start' | 'stop') => makeEngineHandler('service', actionType);
 
-
 	const handleSudoSubmit = (): void => {
 		const password = sudoPasswordInput;
 		setSudoPasswordInput('');
@@ -665,16 +866,50 @@ export const Settings: React.FC = () => {
 	// TAB DEFINITIONS
 	// ========================================================================
 
-	const tabs: ITabPanelTab[] = useMemo(
-		() => [
-			{ id: 'development', label: 'Development' },
-			{ id: 'deployment', label: 'Deployment' },
-			{ id: 'pipeline', label: 'Pipeline' },
-			{ id: 'debugging', label: 'Debugging' },
-			{ id: 'integrations', label: 'Integrations' },
-		],
+	// ViewMenu declaration — rendered as this view's left-hand section nav.
+	const settingsMenu = useMemo<ViewMenu>(
+		() => ({
+			entries: [
+				{ id: 'development', label: 'Development' },
+				{ id: 'deployment', label: 'Deployment' },
+				{ id: 'pipeline', label: 'Pipeline' },
+				{ id: 'integrations', label: 'Integrations' },
+			],
+		}),
 		[]
 	);
+
+	// ── Checkout callbacks (passed to CloudPanel) ──────────────────────
+	const handleFetchPlans = useCallback((): Promise<CheckoutPlan[]> => {
+		return new Promise((resolve, reject) => {
+			checkoutResolvers.current.plans = { resolve, reject };
+			sendMessage({ type: 'checkout:fetchPlans' } as any);
+		});
+	}, [sendMessage]);
+
+	const handleCreateCheckout = useCallback(
+		(priceId: string): Promise<{ clientSecret: string; subscriptionId: string }> => {
+			return new Promise((resolve, reject) => {
+				checkoutResolvers.current.session = { resolve, reject };
+				sendMessage({ type: 'checkout:createSession', priceId } as any);
+			});
+		},
+		[sendMessage]
+	);
+
+	const handleConfirmPending = useCallback(
+		(subscriptionId: string, priceId: string): Promise<void> => {
+			return new Promise((resolve, reject) => {
+				checkoutResolvers.current.confirm = { resolve, reject };
+				sendMessage({ type: 'checkout:confirmPending', subscriptionId, priceId } as any);
+			});
+		},
+		[sendMessage]
+	);
+
+	const handleCheckoutSuccess = useCallback(() => {
+		setSubscribed(true);
+	}, []);
 
 	const panels: Record<string, ITabPanelPanel> = useMemo(
 		() => ({
@@ -685,10 +920,6 @@ export const Settings: React.FC = () => {
 						<ConnectionSettings
 							settings={settings}
 							onSettingsChange={handleSettingsChange}
-							onSave={handleSaveSettings}
-							onCancel={handleCancelSettings}
-							dirty={dirty}
-							saved={saved}
 							onClearCredentials={handleClearCredentials}
 							onTestConnection={handleTestConnection}
 							serverCapabilities={serverCapabilities}
@@ -700,9 +931,7 @@ export const Settings: React.FC = () => {
 							onCloudSignIn={() => sendMessage({ type: 'cloud:signIn' } as any)}
 							onCloudSignOut={() => sendMessage({ type: 'cloud:signOut' } as any)}
 							onProbeCloudServer={handleProbeCloudServer}
-							onFetchTeams={handleFetchTeams}
 							isSaas={isSaasProbed}
-							teams={teams}
 							dockerStatus={dockerStatus}
 							dockerProgress={dockerProgress}
 							dockerError={dockerError}
@@ -733,6 +962,11 @@ export const Settings: React.FC = () => {
 							sudoPasswordInput={sudoPasswordInput}
 							onSudoPasswordChange={setSudoPasswordInput}
 							onSudoSubmit={handleSudoSubmit}
+							isSubscribed={subscribed}
+							onFetchPlans={handleFetchPlans}
+							onCreateCheckout={handleCreateCheckout}
+							onConfirmPending={handleConfirmPending}
+							onCheckoutSuccess={handleCheckoutSuccess}
 						/>
 					</div>
 				),
@@ -744,12 +978,7 @@ export const Settings: React.FC = () => {
 						<DeploySettings
 							settings={settings}
 							onSettingsChange={handleSettingsChange}
-							onSave={handleSaveSettings}
-							onCancel={handleCancelSettings}
-							dirty={dirty}
-							saved={saved}
 							serverCapabilities={serverCapabilities}
-							teams={teams}
 							engineVersions={engineVersions}
 							engineVersionsLoading={engineVersionsLoading}
 							onClearCredentials={handleClearCredentials}
@@ -760,7 +989,6 @@ export const Settings: React.FC = () => {
 							onCloudSignIn={() => sendMessage({ type: 'cloud:signIn' } as any)}
 							onCloudSignOut={() => sendMessage({ type: 'cloud:signOut' } as any)}
 							onProbeCloudServer={handleProbeCloudServer}
-							onFetchTeams={handleFetchTeams}
 							isSaas={isSaasProbed}
 							dockerStatus={dockerStatus}
 							dockerProgress={dockerProgress}
@@ -792,6 +1020,11 @@ export const Settings: React.FC = () => {
 							sudoPasswordInput={sudoPasswordInput}
 							onSudoPasswordChange={setSudoPasswordInput}
 							onSudoSubmit={handleSudoSubmit}
+							isSubscribed={subscribed}
+							onFetchPlans={handleFetchPlans}
+							onCreateCheckout={handleCreateCheckout}
+							onConfirmPending={handleConfirmPending}
+							onCheckoutSuccess={handleCheckoutSuccess}
 						/>
 					</div>
 				),
@@ -800,15 +1033,7 @@ export const Settings: React.FC = () => {
 				content: (
 					<div style={commonStyles.tabContent}>
 						<MessageDisplay message={message} />
-						<PipelineSettings settings={settings} onSettingsChange={handleSettingsChange} onSave={handleSaveSettings} onCancel={handleCancelSettings} dirty={dirty} saved={saved} />
-					</div>
-				),
-			},
-			debugging: {
-				content: (
-					<div style={commonStyles.tabContent}>
-						<MessageDisplay message={message} />
-						<DebuggingSettings settings={settings} onSettingsChange={handleSettingsChange} onSave={handleSaveSettings} onCancel={handleCancelSettings} dirty={dirty} saved={saved} />
+						<PipelineSettings settings={settings} onSettingsChange={handleSettingsChange} />
 					</div>
 				),
 			},
@@ -816,18 +1041,66 @@ export const Settings: React.FC = () => {
 				content: (
 					<div style={commonStyles.tabContent}>
 						<MessageDisplay message={message} />
-						<IntegrationSettings settings={settings} onSettingsChange={handleSettingsChange} onSave={handleSaveSettings} onCancel={handleCancelSettings} dirty={dirty} saved={saved} />
+						<IntegrationSettings settings={settings} onSettingsChange={handleSettingsChange} />
 					</div>
 				),
 			},
 		}),
-		[settings, message, testMessage, engineVersions, engineVersionsLoading, serverCapabilities, cloudSignedIn, cloudUserName, teams, dockerStatus, dockerProgress, dockerError, dockerBusy, dockerAction, dockerVersionOptions, dockerSelectedVersion, serviceStatus, serviceProgress, serviceError, serviceBusy, serviceAction, serviceVersionOptions, serviceSelectedVersion, sudoPromptVisible, sudoPasswordInput]
+		[settings, message, testMessage, engineVersions, engineVersionsLoading, serverCapabilities, cloudSignedIn, cloudUserName, dockerStatus, dockerProgress, dockerError, dockerBusy, dockerAction, dockerVersionOptions, dockerSelectedVersion, serviceStatus, serviceProgress, serviceError, serviceBusy, serviceAction, serviceVersionOptions, serviceSelectedVersion, sudoPromptVisible, sudoPasswordInput]
 	);
 
 	return (
 		<div style={commonStyles.columnFill}>
-			{/* ── Tab panel ─────────────────────────────────────────── */}
-			<TabPanel tabs={tabs} activeTab={activeTab} onTabChange={setActiveTab} panels={panels} />
+			{/* ── Title bar — names the page + one-line description ── */}
+			<div style={settingsHeaderStyles.container}>
+				<h1 style={settingsHeaderStyles.title}>Settings</h1>
+				<div style={settingsHeaderStyles.subtitle}>Configure connections, pipelines, and integrations for the RocketRide extension.</div>
+			</div>
+
+			{/* ── Auth error banner (shown when opened due to auth failure) ── */}
+			{authError && (
+				<div style={authErrorBannerStyles.container}>
+					<div style={authErrorBannerStyles.content}>
+						<span style={{ fontSize: 18 }}>&#9888;</span>
+						<span style={authErrorBannerStyles.text}>{authError}</span>
+						<button style={authErrorBannerStyles.dismiss} onClick={() => setAuthError(null)} title="Dismiss">
+							&#10005;
+						</button>
+					</div>
+				</div>
+			)}
+			{/* ── Body: left section nav (was the top pill strip) + page bodies ── */}
+			<div style={settingsNavStyles.body}>
+				{/* Left nav — one pill per settings section, driving the same activeTab. */}
+				<nav style={settingsNavStyles.sidebar} role="tablist" aria-orientation="vertical">
+					{settingsMenu.entries.map((entry) => {
+						// The selected section is highlighted and rendered by TabPanel.
+						const isActive = entry.id === activeTab;
+						return (
+							<button key={entry.id} role="tab" aria-selected={isActive} style={settingsNavStyles.navItem(isActive)} onClick={() => setActiveTab(entry.id)}>
+								{entry.label}
+							</button>
+						);
+					})}
+				</nav>
+
+				{/* Page bodies fill the space to the right of the nav. */}
+				<div style={pageBodyStyle}>
+					<TabPanel panels={panels} activeId={activeTab} />
+				</div>
+			</div>
+
+			{/* ── Footer — Save/Cancel appear once there are unsaved edits (DetailPanel pattern) ── */}
+			{dirty && (
+				<div style={settingsFooterStyles.bar}>
+					<button style={settingsFooterStyles.cancel} onClick={handleCancelSettings}>
+						Cancel
+					</button>
+					<button style={settingsFooterStyles.save} onClick={handleSaveSettings}>
+						Save
+					</button>
+				</div>
+			)}
 		</div>
 	);
 };

@@ -1,5 +1,7 @@
 """Tests for ALLOWED_MODULES allowlist and WebServer.use() validation."""
 
+import os
+import signal
 import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -30,6 +32,9 @@ _inject('rocketride', _mock_rocketride)
 
 # depends (used transitively by ai.web.__init__)
 _inject('depends', MagicMock())
+
+# rocketlib (server.py imports debug; real module needs the engine's engLib)
+_inject('rocketlib', MagicMock())
 
 # ai.account and its sub-modules (ai.web.__init__ imports ai.account.account)
 _mock_ai_account = MagicMock()
@@ -65,7 +70,7 @@ _inject('dotenv', MagicMock())
 _inject('uvicorn', MagicMock())
 
 # Now we can safely import the module under test
-from ai.web.server import WebServer
+from ai.web.server import WebServer, _build_signal_safe_capture
 from ai.modules import ALL as ALLOWED_MODULES
 
 
@@ -97,6 +102,7 @@ class TestAllowedModules:
             'clients',
             'data',
             'dropper',
+            'mcp',
             'pipe',
             'remote',
             'services',
@@ -163,3 +169,89 @@ class TestUseMethod:
 
         mock_import.assert_not_called()
         cached_module.initModule.assert_not_called()
+
+
+class TestSignalCapture:
+    """Verify Uvicorn shutdown signal restoration is tolerant of embedded runtimes."""
+
+    def test_capture_signals_skips_unrestorable_previous_handler(self, monkeypatch):
+        import ai.web.server as server_module
+
+        handled_signal = signal.SIGTERM
+        fake_server = SimpleNamespace(handle_exit=MagicMock(), _captured_signals=[])
+        calls = []
+
+        server_module.uvicorn.server.HANDLED_SIGNALS = [handled_signal]
+
+        def fake_signal(sig, handler):
+            calls.append((sig, handler))
+            if handler is fake_server.handle_exit:
+                return None
+            if handler is None:
+                raise TypeError('signal handler must be signal.SIG_IGN, signal.SIG_DFL, or a callable object')
+            return signal.SIG_DFL
+
+        monkeypatch.setattr(server_module.signal, 'signal', fake_signal)
+        monkeypatch.setattr(server_module.signal, 'raise_signal', MagicMock())
+
+        capture_signals = _build_signal_safe_capture(fake_server)
+
+        with capture_signals():
+            pass
+
+        assert calls == [(handled_signal, fake_server.handle_exit)]
+
+
+# ============================================================================
+# RR_SIGNING_KEY auto-provisioning tests
+# ============================================================================
+
+
+class TestEnsureSigningKey:
+    """The server self-provisions an ephemeral RR_SIGNING_KEY when unset."""
+
+    def test_generates_key_when_unset(self, monkeypatch):
+        from ai.web.server import _ensure_signing_key
+
+        monkeypatch.delenv('RR_SIGNING_KEY', raising=False)
+        monkeypatch.delenv('RR_STORE_URL', raising=False)
+        _ensure_signing_key()
+        key = os.environ.get('RR_SIGNING_KEY', '')
+        assert len(key) == 64
+        int(key, 16)  # 32 random bytes, hex-encoded
+
+    def test_respects_operator_provided_key(self, monkeypatch):
+        from ai.web.server import _ensure_signing_key
+
+        monkeypatch.setenv('RR_SIGNING_KEY', 'operator-key')
+        _ensure_signing_key()
+        assert os.environ['RR_SIGNING_KEY'] == 'operator-key'
+
+    def test_idempotent_across_calls(self, monkeypatch):
+        from ai.web.server import _ensure_signing_key
+
+        monkeypatch.delenv('RR_SIGNING_KEY', raising=False)
+        monkeypatch.delenv('RR_STORE_URL', raising=False)
+        _ensure_signing_key()
+        first = os.environ['RR_SIGNING_KEY']
+        _ensure_signing_key()
+        assert os.environ['RR_SIGNING_KEY'] == first
+
+    def test_skips_provision_on_non_filesystem_backend(self, monkeypatch):
+        # Cloud/object backends presign natively and never read the key; a
+        # deployment that left RR_SIGNING_KEY unset keeps signed fetch URLs
+        # switched off, exactly as before self-provisioning existed.
+        from ai.web.server import _ensure_signing_key
+
+        monkeypatch.delenv('RR_SIGNING_KEY', raising=False)
+        monkeypatch.setenv('RR_STORE_URL', 's3://bucket/prefix')
+        _ensure_signing_key()
+        assert os.environ.get('RR_SIGNING_KEY') is None
+
+    def test_provisions_on_explicit_filesystem_backend(self, monkeypatch):
+        from ai.web.server import _ensure_signing_key
+
+        monkeypatch.delenv('RR_SIGNING_KEY', raising=False)
+        monkeypatch.setenv('RR_STORE_URL', 'filesystem:///tmp/store')
+        _ensure_signing_key()
+        assert len(os.environ.get('RR_SIGNING_KEY', '')) == 64

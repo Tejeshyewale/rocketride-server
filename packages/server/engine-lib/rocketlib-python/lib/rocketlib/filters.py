@@ -23,9 +23,10 @@
 # =============================================================================
 
 from __future__ import annotations  # Enables forward references
+import functools
 import json
-from typing import TYPE_CHECKING, Dict, Any, Iterable, List, Optional, TypedDict, Callable, Protocol
-from .types import OPEN_MODE, ENDPOINT_MODE, SERVICE_MODE, Entry, IControl, IInvoke
+from typing import TYPE_CHECKING, Dict, Any, List, Optional, TypedDict, Callable, Protocol
+from .types import AVI_ACTION, OPEN_MODE, ENDPOINT_MODE, SERVICE_MODE, Entry, IControl, IInvoke, IJson
 from .error import APERR, Ec
 
 if TYPE_CHECKING:
@@ -90,387 +91,6 @@ def tool_function(
         return fn
 
     return decorator
-
-
-# =========================================================================
-# Tool input normalisation
-#
-# Agents call tools with payloads that the engine's invoke pipeline can
-# deliver in several shapes — plain dicts, Pydantic models, JSON strings,
-# or wrapped envelopes such as {"input": {...}, "security_context": ...}.
-# Every tool node used to ship its own copy of this normalisation
-# function; consolidating into one canonical helper means bug fixes and
-# behaviour decisions live in one place.
-# =========================================================================
-
-
-def normalize_tool_input(
-    input_obj: Any,
-    *,
-    extra_envelope_keys: Iterable[str] = (),
-    strip_keys: Iterable[str] = ('security_context',),
-    parse_json_strings: bool = True,
-    unwrap_pydantic: bool = True,
-    tool_name: str = 'tool',
-) -> Dict[str, Any]:
-    """Coerce agent-supplied tool input to a plain args dict.
-
-    Handles, in order:
-      1. ``None`` -> ``{}``
-      2. Pydantic model unwrap (via ``model_dump()`` / ``dict()``) when
-         ``unwrap_pydantic`` is True.
-      3. JSON-string parse when ``parse_json_strings`` is True. A string
-         that does not parse to a dict is left unchanged (and falls through
-         to the unexpected-type branch below).
-      4. Anything still not a dict -> ``{}`` after a ``warning(...)``.
-      5. Nested envelope unwrap: any of ``('input', *extra_envelope_keys)``
-         whose value is a dict is merged into the top level. Top-level keys
-         win on conflict (so a sibling key beside the envelope overrides
-         the one inside it).
-      6. Strip every key listed in ``strip_keys``.
-
-    Args:
-        input_obj: Raw tool input as delivered by the engine's invoke chain.
-        extra_envelope_keys: Additional keys that, like ``input``, wrap the
-            real arguments and should be unwrapped/merged.
-        strip_keys: Keys to drop from the final dict before returning.
-            Defaults to ``('security_context',)`` — engine-injected and
-            never a tool arg. Pass ``()`` to disable stripping, or a list
-            to add more (e.g. ``('security_context', 'trace_id')``).
-        parse_json_strings: Try ``json.loads`` on string inputs. Set False
-            for tools where the engine path is known never to deliver a
-            JSON-encoded string.
-        unwrap_pydantic: Call ``model_dump()`` / ``dict()`` on objects that
-            expose them. Set False for tools where the engine path never
-            delivers a Pydantic instance.
-        tool_name: Short identifier prefixed onto warning messages so
-            unexpected-input traces are attributable to a specific node.
-
-    Returns:
-        A plain ``dict`` of normalised tool arguments. Returns ``{}`` for
-        inputs that cannot be coerced (e.g. integers, lists, malformed
-        JSON), after emitting a warning.
-    """
-    if input_obj is None:
-        return {}
-
-    if unwrap_pydantic:
-        model_dump = getattr(input_obj, 'model_dump', None)
-        if callable(model_dump):
-            input_obj = model_dump()
-        else:
-            as_dict = getattr(input_obj, 'dict', None)
-            if callable(as_dict):
-                input_obj = as_dict()
-
-    if parse_json_strings and isinstance(input_obj, str):
-        try:
-            parsed = json.loads(input_obj)
-        except (json.JSONDecodeError, TypeError):
-            parsed = None
-        if isinstance(parsed, dict):
-            input_obj = parsed
-
-    if not isinstance(input_obj, dict):
-        # Lazy import: engine.py imports from filters.py, so we can't pull
-        # warning() at module load.
-        from .engine import warning
-
-        warning(f'{tool_name}: unexpected input type {type(input_obj).__name__}')
-        return {}
-
-    # Shallow-copy so the envelope-merge and the strip_keys pop below
-    # never mutate a caller-owned dict.
-    input_obj = dict(input_obj)
-
-    for key in ('input', *extra_envelope_keys):
-        wrapped = input_obj.get(key)
-        if isinstance(wrapped, dict):
-            extras = {k: v for k, v in input_obj.items() if k != key}
-            input_obj = {**wrapped, **extras}
-
-    for key in strip_keys:
-        input_obj.pop(key, None)
-    return input_obj
-
-
-# =========================================================================
-# Tool argument validators
-#
-# Tool nodes used to ship private ``_require_str`` / ``_require_int`` /
-# ``_optional_str`` helpers with subtly inconsistent semantics — for
-# example, tool_github's ``_require_str`` crashed with ``AttributeError``
-# on truthy non-string inputs, while tool_filesystem's variant raised a
-# clean ValueError. Centralising the helpers here lets every tool node
-# get the same validation behaviour and leaves room to fix bugs in one
-# place.
-# =========================================================================
-
-
-def require_str(args: Dict[str, Any], key: str, *, tool_name: str = '') -> str:
-    """Return ``args[key]`` as a non-empty stripped string, or raise ValueError.
-
-    Args:
-        args: The normalised tool args dict (typically the output of
-            :func:`normalize_tool_input`).
-        key: The required argument name.
-        tool_name: Short identifier prefixed onto error messages — usually
-            the tool function name (``'file_create'``) or node name
-            (``'tool_github'``). Empty string omits the prefix.
-
-    Raises:
-        ValueError: If ``key`` is missing, not a string, or is empty/whitespace.
-    """
-    val = args.get(key)
-    if not isinstance(val, str) or not val.strip():
-        prefix = f'{tool_name}: ' if tool_name else ''
-        raise ValueError(f'{prefix}"{key}" is required and must be a non-empty string')
-    return val.strip()
-
-
-def require_int(
-    args: Dict[str, Any],
-    key: str,
-    *,
-    lo: Optional[int] = None,
-    hi: Optional[int] = None,
-    tool_name: str = '',
-) -> int:
-    """Return ``args[key]`` coerced to ``int``, or raise ValueError.
-
-    Accepts plain ints and numeric strings. The following are rejected with
-    a ValueError instead of being silently coerced:
-
-    * ``bool`` — despite being an ``int`` subclass, ``{"issue_number": true}``
-      almost never means ``1``.
-    * ``float`` — ``int(3.7)`` would truncate to ``3``, and ``inf`` / ``nan``
-      would leak an ``OverflowError`` / ``ValueError`` from ``int()``.
-    * Any other non-(int|str) type, e.g. lists, dicts, ``Decimal``.
-
-    Optional bounds:
-
-    * ``lo`` — if set, the value must be ``>= lo``.
-    * ``hi`` — if set, the value must be ``<= hi``.
-    * Both — the value must lie in ``[lo, hi]``.
-    * Neither — no range check.
-
-    The error message advertises the configured bounds so the agent can
-    see what range it should retry within.
-    """
-    prefix = f'{tool_name}: ' if tool_name else ''
-    val = args.get(key)
-    if val is None:
-        raise ValueError(f'{prefix}"{key}" is required')
-    # bool is an int subclass and float would truncate — keep str and real
-    # int as the only inputs that reach the coercion below. OverflowError
-    # is also caught for defence-in-depth (e.g. ``int('1' * 10**6)`` is
-    # technically valid but takes minutes; an opaque traceback would be
-    # worse than the friendly message).
-    if isinstance(val, (bool, float)) or not isinstance(val, (int, str)):
-        raise ValueError(f'{prefix}"{key}" must be an integer{_range_phrase(lo, hi)}')
-    try:
-        out = int(val)
-    except (TypeError, ValueError, OverflowError):
-        raise ValueError(f'{prefix}"{key}" must be an integer{_range_phrase(lo, hi)}')
-    if lo is not None and out < lo:
-        raise ValueError(f'{prefix}"{key}" must be an integer{_range_phrase(lo, hi)}')
-    if hi is not None and out > hi:
-        raise ValueError(f'{prefix}"{key}" must be an integer{_range_phrase(lo, hi)}')
-    return out
-
-
-def _range_phrase(lo: Optional[int], hi: Optional[int]) -> str:
-    """Render ' between LO and HI' / ' >= LO' / ' <= HI' / ''."""
-    if lo is not None and hi is not None:
-        return f' between {lo} and {hi}'
-    if lo is not None:
-        return f' >= {lo}'
-    if hi is not None:
-        return f' <= {hi}'
-    return ''
-
-
-def require_bool(args: Dict[str, Any], key: str, *, tool_name: str = '') -> bool:
-    """Return ``args[key]`` as ``bool``, or raise ValueError.
-
-    Strict on type to keep agent intent unambiguous. Accepts ``True`` and
-    ``False`` only — no truthy coercion of ``1``/``0``/``"true"``/``"false"``,
-    because schemas declared ``"type": "boolean"`` mean exactly that and
-    a coerced string smells like an LLM hallucination worth flagging.
-
-    For optional booleans (typical schema default), call
-    ``args.setdefault(key, <default>)`` before this helper.
-    """
-    prefix = f'{tool_name}: ' if tool_name else ''
-    val = args.get(key)
-    if val is None:
-        raise ValueError(f'{prefix}"{key}" is required')
-    if not isinstance(val, bool):
-        raise ValueError(f'{prefix}"{key}" must be a boolean')
-    return val
-
-
-def validate_tool_input_schema(
-    input_schema: Dict[str, Any],
-    args: Dict[str, Any],
-    *,
-    tool_name: str = '',
-) -> None:
-    """Reject any *args* keys not declared in ``input_schema['properties']``.
-
-    Without this check, a hallucinated parameter name (e.g. ``include_remote``
-    instead of the schema's ``remote``) is silently dropped by the dispatcher
-    and the call returns a default-valued result the agent then misreads —
-    "this tool doesn't support remotes" — and gives up. Raising a clean
-    ValueError that names the bad key and lists the allowed ones lets the
-    agent self-correct on the next turn.
-
-    The framework's ``@tool_function`` only uses ``input_schema`` to build
-    the ``tool.query`` descriptor; runtime validation is opt-in via this
-    helper. Pair it with :func:`normalize_tool_input` for the typical
-    "strip envelope, then validate" pattern at tool-method entry.
-
-    Args:
-        input_schema: The JSON-schema-shaped dict that's also passed to
-            ``@tool_function``. Only ``input_schema['properties']`` is
-            consulted; missing or ``None`` is treated as "no allowed keys".
-        args: The (already-normalised) tool arguments dict.
-        tool_name: Short identifier prefixed onto error messages so an
-            agent looking at multiple errors can attribute each to the
-            specific tool. Empty string omits the prefix.
-
-    Raises:
-        ValueError: If ``args`` contains any key not in
-            ``input_schema['properties']``. The message lists the unknown
-            keys and the allowed ones (or "this tool takes no parameters"
-            for schemas with empty properties).
-    """
-    allowed = set((input_schema.get('properties') or {}).keys())
-    unknown = sorted(k for k in args if k not in allowed)
-    if not unknown:
-        return
-    prefix = f'{tool_name}: ' if tool_name else ''
-    if allowed:
-        raise ValueError(f'{prefix}unknown parameter(s) {unknown}. Allowed parameters: {sorted(allowed)}.')
-    raise ValueError(f'{prefix}this tool takes no parameters; received unexpected: {unknown}.')
-
-
-def optional_bool(
-    args: Dict[str, Any],
-    key: str,
-    *,
-    default: Any = None,
-    tool_name: str = '',
-) -> Any:
-    """Return ``args[key]`` as ``bool``, or ``default`` if absent/None.
-
-    Type rules mirror :func:`require_bool` exactly when the key is present
-    (strict ``True`` / ``False`` only — no truthy coercion of ``1``/``0``/
-    ``"true"``). The only difference is the absent-key path: instead of
-    raising "is required", ``default`` is returned.
-
-    Following :func:`optional_str`: type validation only fires when ``key``
-    is present. ``default`` is returned untouched on the absent path so
-    callers can use non-bool sentinels (e.g. ``object()``, ``None``) without
-    the helper rejecting them.
-
-    Args:
-        args: The (already-normalised) tool arguments dict.
-        key: The optional argument name.
-        default: Value to return when ``key`` is missing or its value is None.
-            Defaults to ``None``. Returned untouched — the helper does NOT
-            type-check the default; an unusual default is an author-side
-            choice, not an agent-side bug.
-        tool_name: Short identifier prefixed onto error messages.
-
-    Raises:
-        ValueError: If ``key`` is present with a non-bool value.
-    """
-    if key not in args:
-        return default
-    val = args[key]
-    if val is None:
-        return default
-    if not isinstance(val, bool):
-        prefix = f'{tool_name}: ' if tool_name else ''
-        raise ValueError(f'{prefix}"{key}" must be a boolean')
-    return val
-
-
-def optional_int(
-    args: Dict[str, Any],
-    key: str,
-    *,
-    default: Any = None,
-    lo: Optional[int] = None,
-    hi: Optional[int] = None,
-    tool_name: str = '',
-) -> Any:
-    """Return ``args[key]`` coerced to ``int``, or ``default`` if absent/None.
-
-    Type and bounds rules mirror :func:`require_int` exactly when the key is
-    present (bool / float / unsupported types rejected; optional ``lo`` / ``hi``
-    inclusive bounds checked). The only difference is the absent-key path:
-    instead of raising "is required", ``default`` is returned.
-
-    Following :func:`optional_str`: type and bounds validation only fires
-    when ``key`` is present. ``default`` is returned untouched on the absent
-    path so callers can use non-int sentinels (e.g. ``object()``) without
-    the helper rejecting them.
-
-    Args:
-        args: The (already-normalised) tool arguments dict.
-        key: The optional argument name.
-        default: Value to return when ``key`` is missing or its value is None.
-            Defaults to ``None``. Returned untouched — the helper does NOT
-            range-check the default; an out-of-range default is an
-            author-side bug, not an agent-side bug.
-        lo: If set, the value (when present) must be ``>= lo``.
-        hi: If set, the value (when present) must be ``<= hi``.
-        tool_name: Short identifier prefixed onto error messages so a
-            multi-tool dispatcher can attribute each error to a tool.
-
-    Raises:
-        ValueError: If ``key`` is present with a non-int value, or with an
-            int outside the configured ``[lo, hi]`` bounds.
-    """
-    if key not in args:
-        return default
-    val = args[key]
-    if val is None:
-        return default
-    # Reuse require_int's type + range machinery so the validation rules
-    # stay in sync between required and optional variants.
-    return require_int({key: val}, key, lo=lo, hi=hi, tool_name=tool_name)
-
-
-def optional_str(
-    args: Dict[str, Any],
-    key: str,
-    *,
-    default: Any = None,
-    tool_name: str = '',
-) -> Any:
-    """Return ``args[key]`` as a string, or ``default`` if absent/None.
-
-    Raises ValueError if ``key`` is present but the value is not a string.
-    Unlike :func:`require_str`, the returned value is **not** stripped — an
-    explicitly-supplied "" stays "".
-
-    Type validation only fires when ``key`` is present with a non-string
-    value. A non-string ``default`` is returned untouched on the absent
-    path — validating ``default`` would mean the helper rejects perfectly
-    legitimate ``optional_str(args, 'n', default=0)`` calls.
-    """
-    if key not in args:
-        return default
-    val = args[key]
-    if val is None:
-        return default
-    if not isinstance(val, str):
-        prefix = f'{tool_name}: ' if tool_name else ''
-        raise ValueError(f'{prefix}"{key}" must be a string')
-    return val
 
 
 class IKeyValueStore:
@@ -775,6 +395,10 @@ class IServiceFilterInstance(Protocol):
         """Send a table structure."""
         pass
 
+    def sendJson(self, data: IJson) -> None:
+        """Send a JSON object."""
+        pass
+
     def sendAudio(self, action: int, mimeType: str, buffer: bytes) -> None:
         """Send an audio buffer with the given action and MIME type."""
         pass
@@ -899,6 +523,10 @@ class IServiceFilterInstance(Protocol):
         """Send a table structure."""
         pass
 
+    def writeJson(self, data: IJson) -> None:
+        """Send a JSON object."""
+        pass
+
     def writeAudio(self, action: int, mimeType: str, buffer: bytes) -> None:
         """Send an audio buffer with the given action and MIME type."""
         pass
@@ -974,12 +602,213 @@ class IFilterInstance(IServiceFilterInstance, Protocol):
         ...
 
 
+# =========================================================================
+# Media lane normalization
+#
+# A media lane delivers BEGIN / WRITE... / END, and the call carries no stream
+# identifier — only the lane and the MIME type. A consumer therefore keeps one
+# slot of state per lane, and reads a fresh BEGIN as proof the previous stream
+# ended. When a single object emits several streams on one lane, that next
+# BEGIN can arrive while the previous stream's END is still outstanding even
+# though every byte has already been delivered, and the consumer throws away a
+# complete stream.
+#
+# The wrapper below closes that for every node at once. It counts the bytes a
+# stream receives, compares them against the size the stream's own BEGIN
+# declared, and calls the node's own END handler for a stream that got
+# everything it promised — before letting the next BEGIN through. Consumers see
+# whole streams and need no bookkeeping of their own.
+# =========================================================================
+
+#: Doc.type values marking a media BEGIN payload as a stream descriptor. Mirrors
+#: ai.common.avi.descriptor.STREAM_TYPES and testdata/contracts/descriptor_keys.json;
+#: kept as a literal because rocketlib must not import ai at runtime.
+_AVI_STREAM_TYPES = ('VideoStream', 'AudioStream', 'ImageStream')
+
+#: Media handlers wrapped on every subclass, mapped to the lane they serve.
+_AVI_MEDIA_METHODS = {'writeImage': 'image', 'writeAudio': 'audio', 'writeVideo': 'video'}
+
+
+def _avi_declared_size(payload: Any) -> Optional[int]:
+    """
+    Read the byte count a media BEGIN payload declares.
+
+    Only the size is wanted, so this deliberately accepts payloads that
+    ``ai.common.avi.descriptor.descriptor_from_payload`` rejects: that parser also
+    demands ``metadata.objectId``, which the C++ builder emits only when the entry
+    carries one. A stream can declare a perfectly usable size without it.
+
+    A ``type`` marker is required, though. With ``ROCKETRIDE_STREAM_DESCRIPTOR=0``
+    the engine forwards the producer's own enrichment unwrapped, and that carries a
+    ``size`` but never a ``type`` — reading it would make the kill switch quietly
+    change behaviour instead of disabling the feature.
+
+    Args:
+        payload (Any): The raw BEGIN byte slot.
+
+    Returns:
+        Optional[int]: The declared size, or None when the payload is not a stream
+        descriptor or declares no usable size.
+    """
+    if not payload:
+        return None
+    try:
+        data = json.loads(bytes(payload).decode('utf-8'))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get('type') not in _AVI_STREAM_TYPES:
+        return None
+    metadata = data.get('metadata')
+    if not isinstance(metadata, dict):
+        return None
+    size = metadata.get('size')
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        return None
+    return size
+
+
+def _avi_object_failed(obj: Any) -> bool:
+    """
+    Report whether an object is explicitly marked failed.
+
+    Compared with ``is True`` rather than tested for truth on purpose: test harnesses
+    build ``currentObject`` from a MagicMock, where every unset attribute is a truthy
+    Mock, and a plain truthiness test would read each of them as failed and disable
+    the settle everywhere while the tests still passed.
+
+    Args:
+        obj (Any): The object to inspect, never None here.
+
+    Returns:
+        bool: True only when the flag is genuinely set.
+    """
+    return getattr(obj, 'objectFailed', False) is True
+
+
+class _AviLane:
+    """One media lane's view of the stream currently travelling over it."""
+
+    __slots__ = ('open', 'mime', 'owner', 'declared', 'written', 'late')
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self) -> None:
+        """Forget everything about this lane, including any outstanding END debt."""
+        self.open = False
+        self.mime = ''
+        self.owner = None
+        self.declared = None
+        self.written = 0
+        self.late = 0
+
+
+def _avi_media_wrapper(method: Callable, lane: str) -> Callable:
+    """
+    Wrap one media handler so the node sees whole streams.
+
+    Args:
+        method (Callable): The subclass's own handler.
+        lane (str): The lane it serves — 'image', 'audio' or 'video'.
+
+    Returns:
+        Callable: The wrapping handler, stamped so it is never wrapped twice.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, action, mimeType, buffer=b''):
+        # A sub-subclass calling super() reaches a second live wrapper; the inner one
+        # delegates so the bytes are counted once.
+        if getattr(self, '_avi_reentrant', False):
+            return method(self, action, mimeType, buffer)
+
+        self._avi_reentrant = True
+        try:
+            state = self._avi_lane(lane)
+
+            if action == AVI_ACTION.BEGIN:
+                if state.open:
+                    self._avi_settle(lane, state, method)
+                    # The displaced stream may still send its own END; owe one swallow.
+                    state.late += 1
+                state.open = True
+                state.mime = mimeType
+                state.owner = self._avi_owner()
+                state.declared = _avi_declared_size(buffer)
+                state.written = 0
+
+            elif action == AVI_ACTION.WRITE:
+                state.written += len(buffer) if buffer else 0
+
+            elif action == AVI_ACTION.END:
+                if state.open:
+                    state.open = False
+                elif state.late > 0:
+                    state.late -= 1
+                    return None
+
+            return method(self, action, mimeType, buffer)
+        finally:
+            self._avi_reentrant = False
+
+    wrapper.__avi_normalized__ = True
+    return wrapper
+
+
+def _avi_open_wrapper(method: Callable) -> Callable:
+    """Wrap open() so media state never crosses an object boundary.
+
+    Takes the node's arguments through untouched: nodes spell this parameter several
+    ways, and the wrapper has no interest in it.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        self._avi_reset_lanes()
+        return method(self, *args, **kwargs)
+
+    wrapper.__avi_normalized__ = True
+    return wrapper
+
+
+def _avi_close_wrapper(method: Callable) -> Callable:
+    """Wrap close() so a stream the producer never ended is still settled."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        self._avi_settle_lanes()
+        return method(self, *args, **kwargs)
+
+    wrapper.__avi_normalized__ = True
+    return wrapper
+
+
 class IInstanceBase:
     """
     Base class for all IInstances.
 
     These calls may all be overridden in derived
     classes. The engine will call these functions.
+
+    Media lanes are normalized for every subclass (see the block above). A handler
+    for ``writeImage``/``writeAudio``/``writeVideo`` receives, per stream, exactly
+    one BEGIN, zero or more WRITEs, and at most one END. That END is either the
+    producer's own, forwarded exactly as it arrives, or one this base supplies in its
+    place — when the next stream begins on the lane, or as the object closes.
+
+    The base supplies one only for a stream that received every byte its BEGIN
+    declared, so the guarantee is this and no more: a stream displaced by the next
+    BEGIN, or still open when the object closes, is either ended or reported — never
+    dropped in silence. One case is deliberately left out of that: a stream that
+    neither promised bytes nor delivered any goes without an END and without a word,
+    having lost nothing. A producer's own END is never checked against the declared
+    size, so a handler that must know its bytes are whole still checks them itself.
+
+    A displaced stream that carried no bytes, fell short of what it declared, or
+    declared nothing at all gets no END; the handler learns of it from the next BEGIN
+    on that lane, or from ``open()``, and must release whatever it holds there. A
+    handler owning an external resource (a write handle, a decoder) should also sweep
+    in its own ``closing()``.
     """
 
     IEndpoint: IEndpointBase = None  #: Endpoint instance for communication.
@@ -990,6 +819,230 @@ class IInstanceBase:
     These are all the overrides to provide
     the driver funtionality.
     """
+
+    # ------------------------------------------------------------------
+    # Media lane normalization
+    #
+    # Wrapping every subclass, rather than offering a mixin or a hook to
+    # inherit from, is the point: a node that merely defines writeImage()
+    # would silently miss any scheme it had to remember to join, and that
+    # silence is the failure this exists to remove.
+    # ------------------------------------------------------------------
+
+    def __init_subclass__(cls, **kwargs):
+        """Wrap the subclass's media and per-object handlers with the AVI normalization."""
+        super().__init_subclass__(**kwargs)
+
+        for name, lane in _AVI_MEDIA_METHODS.items():
+            fn = cls.__dict__.get(name)
+            if callable(fn) and not getattr(fn, '__avi_normalized__', False):
+                setattr(cls, name, _avi_media_wrapper(fn, lane))
+
+        for name, wrap in (('open', _avi_open_wrapper), ('close', _avi_close_wrapper)):
+            fn = cls.__dict__.get(name)
+            if callable(fn) and not getattr(fn, '__avi_normalized__', False):
+                setattr(cls, name, wrap(fn))
+
+    def _avi_lane(self, lane: str) -> '_AviLane':
+        """
+        Return this lane's stream state, created on first use.
+
+        Built lazily because not every node calls ``super().__init__()`` — several
+        define no ``__init__`` at all — so there is no constructor to rely on.
+
+        Args:
+            lane (str): The media lane.
+
+        Returns:
+            _AviLane: The lane's state, owned by this instance alone.
+        """
+        lanes = getattr(self, '_avi_lanes', None)
+        if lanes is None:
+            lanes = {}
+            self._avi_lanes = lanes
+        state = lanes.get(lane)
+        if state is None:
+            state = lanes[lane] = _AviLane()
+        return state
+
+    def _avi_current_object(self) -> Any:
+        """
+        Return the object a stream should be attributed to, or None.
+
+        Both hops are genuinely nullable: ``instance`` defaults to None on this
+        class, and the engine clears ``currentEntry`` again when an object fails
+        to open.
+
+        Returns:
+            Any: The current object, or None when there is not one.
+        """
+        return getattr(getattr(self, 'instance', None), 'currentObject', None)
+
+    def _avi_owner(self) -> Optional[str]:
+        """
+        Return a label for the object owning a stream, for the log line.
+
+        Captured at BEGIN and kept on the lane, never read back later: by the time
+        ``open()`` reports a lost stream the current object has already advanced to
+        the next one, and naming that one would send a reader to the wrong input.
+
+        Returns:
+            Optional[str]: The object's name, else its id, else None.
+        """
+        obj = self._avi_current_object()
+        if obj is None:
+            return None
+        if getattr(obj, 'hasName', False):
+            name = getattr(obj, 'name', None)
+            if name:
+                return str(name)
+        objectId = getattr(obj, 'objectId', None)
+        return str(objectId) if objectId else None
+
+    def _avi_invoke(self, method: Callable, action: int, mimeType: str, buffer: bytes) -> None:
+        """
+        Call a media handler for a stream the engine is not waiting on.
+
+        Handlers commonly end in ``preventDefault()``, which raises; nothing is
+        waiting on a synthesized call, so that signal is swallowed. Every other
+        error propagates exactly as it would from a real END — a decoder reporting
+        a failure off its background thread still fails the object.
+
+        Args:
+            method (Callable): The subclass's own (unwrapped) handler.
+            action (int): The AVI action to deliver.
+            mimeType (str): The MIME type of the stream being closed out.
+            buffer (bytes): The payload slot, empty for a synthesized END.
+        """
+        # Held for the whole call: a node subclassing another node reaches the parent's
+        # wrapper through super(), and that wrapper must pass straight through rather
+        # than run the state machine a second time for an END this code already handled.
+        previous = getattr(self, '_avi_reentrant', False)
+        self._avi_reentrant = True
+        try:
+            method(self, action, mimeType, buffer)
+        except APERR as e:
+            if e.ec != Ec.PreventDefault:
+                raise
+        finally:
+            self._avi_reentrant = previous
+
+    def _avi_warn_lost(self, lane: str, state: '_AviLane', reason: str = 'it could not be settled') -> None:
+        """
+        Report a pending stream that was dropped.
+
+        Silent for a stream that promised nothing and delivered nothing: that is an
+        empty stream rather than a loss, and a line firing on ordinary traffic is
+        one nobody reads.
+
+        Args:
+            lane (str): The media lane.
+            state (_AviLane): The lane's state, still holding the lost stream.
+            reason (str): Why the stream went unsettled. Named rather than assumed:
+                a complete stream held back because its object failed reads as a
+                truncated one otherwise, and sends the reader hunting for a cut-off
+                that never happened.
+        """
+        if not state.written and not state.declared:
+            return
+
+        # Imported here: engine.py imports this module, so a module-level import
+        # would be circular.
+        from .engine import warning
+
+        warning(
+            f'media lane {lane}: dropped a stream, {reason} '
+            f'(object={state.owner}, mime={state.mime}, '
+            f'declared={state.declared}, written={state.written})'
+        )
+
+    def _avi_settle(self, lane: str, state: '_AviLane', method: Callable) -> None:
+        """
+        Close out a pending stream that received every byte it declared.
+
+        Delivers the END the producer never sent, so the commit path the stream
+        would have taken anyway is the one that runs. A stream that fell short,
+        carried no bytes, or declared no size gets no END and is reported instead:
+        the declared size is the only completeness signal available, so nothing is
+        committed on a guess.
+
+        Args:
+            lane (str): The media lane.
+            state (_AviLane): The lane's state.
+            method (Callable): The subclass's own (unwrapped) handler.
+        """
+        if state.declared is not None and state.written == state.declared and state.written > 0:
+            self._avi_invoke(method, AVI_ACTION.END, state.mime, b'')
+            return
+        self._avi_warn_lost(lane, state)
+
+    def _avi_handler(self, lane: str) -> Optional[Callable]:
+        """
+        Return the subclass's own handler for a lane, unwrapped.
+
+        Args:
+            lane (str): The media lane.
+
+        Returns:
+            Optional[Callable]: The underlying function, or None when this node does
+            not consume the lane.
+        """
+        for name, served in _AVI_MEDIA_METHODS.items():
+            if served != lane:
+                continue
+            fn = getattr(type(self), name, None)
+            return getattr(fn, '__wrapped__', fn)
+        return None
+
+    def _avi_settle_lanes(self) -> None:
+        """
+        Settle whatever is still open as the object closes.
+
+        ``close()`` is the last point at which ``currentObject`` is still the
+        stream's own object: ``open()`` has already advanced it and ``closing()``
+        runs after it is cleared, so this is the only per-object place a synthesized
+        END can be attributed correctly. A failed object settles nothing — it must
+        not publish output it would never otherwise have produced — and its pending
+        streams are reported with that as the stated reason.
+
+        Every open lane is marked closed here, whichever way it went, so ``open()``
+        does not report the same loss a second time.
+        """
+        lanes = getattr(self, '_avi_lanes', None)
+        if not lanes:
+            return
+
+        obj = self._avi_current_object()
+        reason = None
+        if obj is None:
+            reason = 'its object is no longer current'
+        elif _avi_object_failed(obj):
+            reason = 'its object failed'
+
+        for lane, state in lanes.items():
+            if not state.open:
+                continue
+            if reason is not None:
+                self._avi_warn_lost(lane, state, reason)
+            else:
+                method = self._avi_handler(lane)
+                if method is not None:
+                    self._avi_settle(lane, state, method)
+            state.open = False
+
+    def _avi_reset_lanes(self) -> None:
+        """
+        Report and clear whatever the finished object left pending.
+
+        Runs from ``open()``, which reports but never commits: the current object is
+        already the next one by then. The reset matters in its own right — an object
+        can end still owing trailing ENDs, and carrying that debt across the boundary
+        would swallow the next object's genuine ones.
+        """
+        for lane, state in (getattr(self, '_avi_lanes', None) or {}).items():
+            if state.open:
+                self._avi_warn_lost(lane, state)
+            state.reset()
 
     def preventDefault(self) -> None:
         """Prevent the default action from occurring."""
@@ -1324,8 +1377,12 @@ class IInstanceBase:
         pass
 
     def open(self, obj: Entry) -> None:
-        """Open an object."""
-        pass
+        """Open an object.
+
+        A subclass defining its own ``open()`` gets the same sweep wrapped around it;
+        this body carries it for the nodes that define none.
+        """
+        self._avi_reset_lanes()
 
     def writeText(self, text: str) -> None:
         """Send a text string."""
@@ -1333,6 +1390,10 @@ class IInstanceBase:
 
     def writeTable(self, table: str) -> None:
         """Send a table structure."""
+        pass
+
+    def writeJson(self, data: IJson) -> None:
+        """Send a JSON object."""
         pass
 
     def writeAudio(self, action: int, mimeType: str, buffer: bytes) -> None:
@@ -1370,12 +1431,22 @@ class IInstanceBase:
         pass
 
     def closing(self) -> None:
-        """Perform any actions required before closing."""
+        """Perform any actions required before closing.
+
+        Nothing is settled here: this runs after the final ``close()``, when the
+        engine has already cleared the current object, so a stream committed from
+        here would have no object to belong to. A node holding an external resource
+        still sweeps it here — releasing a handle needs no object.
+        """
         pass
 
     def close(self) -> None:
-        """Close the instance."""
-        pass
+        """Close the instance.
+
+        A subclass defining its own ``close()`` gets the same settle wrapped around
+        it; this body carries it for the nodes that define none.
+        """
+        self._avi_settle_lanes()
 
 
 class ILoader(Protocol):

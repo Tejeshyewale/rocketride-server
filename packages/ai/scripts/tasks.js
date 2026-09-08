@@ -53,7 +53,25 @@ function makeSyncAiAction() {
     return {
         run: async (ctx, task) => {
             task.output = 'Scanning for changes...';
-            const stats = await syncDir(SRC_DIR, DIST_DIR, { mirror: false, package: true });
+            const stats = await syncDir(SRC_DIR, DIST_DIR, {
+                mirror: false,
+                package: true,
+                // The mcp-widgets vite workspace lives inside the module
+                // (modules/mcp/apps); only its built dist/ belongs in the
+                // server dist — never the toolchain, sources, or node_modules.
+                // node_modules is excluded everywhere, not just there: dev
+                // installs inside src carry pnpm symlinks that copyfile cannot
+                // handle (ENOTSUP), and runtime JS deps ship bundled, not raw.
+                ignore: [
+                    '**/__pycache__/**',
+                    '**/node_modules/**',
+                    'modules/mcp/apps/src/**',
+                    'modules/mcp/apps/scripts/**',
+                    'modules/mcp/apps/package.json',
+                    'modules/mcp/apps/tsconfig.json',
+                    'modules/mcp/apps/vite.config.ts',
+                ],
+            });
             task.output = formatSyncStats(stats);
         }
     };
@@ -66,7 +84,9 @@ function makeRunPytestAction(options = {}) {
         run: async (ctx, task) => {
             const aiTestRequirements = path.join(TESTS_DIR, 'requirements.txt');
             task.output = `Installing AI test requirements (${aiTestRequirements})...`;
-            await execCommand(ENGINE, ['-m', 'pip', 'install', '--quiet', '-r', aiTestRequirements], {
+            // Install via depends() so the engine's constraints apply; plain pip
+            // ignores them and resolves unpinned deps (e.g. pillow) to latest.
+            await execCommand(ENGINE, ['-c', 'import sys; from depends import depends; depends(sys.argv[1])', aiTestRequirements], {
                 task,
                 cwd: SERVER_DIR
             });

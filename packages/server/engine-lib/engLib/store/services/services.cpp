@@ -32,6 +32,13 @@ static application::Opt ServiceName{"--serviceName"};
 static application::Opt ServiceCat{"--serviceCategory"};
 
 //-------------------------------------------------------------------------
+/// @details
+///		Optional directory that holds a `local_nodes` folder, scanned in
+///		addition to the built-in nodes, e.g. --node_path=/work
+//-------------------------------------------------------------------------
+static application::Opt NodePath{"--node_path"};
+
+//-------------------------------------------------------------------------
 //
 //	The format for the service entries is pretty complex, but easy
 //	once you understand it. Each service .json file, located in the
@@ -1085,8 +1092,9 @@ ErrorOr<IServices::ServiceSchema> IServices::getField(
             info.ui["ui:order"].append(logicalType);
         }
 
-        // Setup the default
-        field["properties"]["provider"]["default"] = defaultProvider;
+        // Setup the default - respect explicit default from combo field definition if provided
+        Text explicitDefault = fieldInfo.lookup<Text>("default", "");
+        field["properties"]["provider"]["default"] = explicitDefault ? explicitDefault : defaultProvider;
 
         // Set the enum values
         field["properties"]["provider"]["enum"] = enumValues;
@@ -1669,6 +1677,20 @@ Error IServices::init() noexcept {
             // Resolve all the descriptions fields
             resolveDescriptions(serviceInfo);
 
+            // Resolve the icon reference to its absolute file location.
+            // The icon field in a services.json is relative to the file's
+            // own directory, and only the loader knows where that is. The
+            // resolved path is consumed SERVER-SIDE (the Python service
+            // catalog reads the file to inline its content) and must never
+            // be returned to clients.
+            if (auto iconName = serviceInfo.lookup<Text>("icon")) {
+                const auto iconPath = (path / iconName).resolve();
+                if (!file::exists(iconPath))
+                    LOG(Services, "    Icon          : **** MISSING",
+                        iconPath, "****");
+                serviceInfo["icon"] = static_cast<const Utf8Chr *>(iconPath);
+            }
+
             // Declare our definition
             IServices::ServiceDefinition def;
 
@@ -1976,6 +1998,20 @@ Error IServices::init() noexcept {
 
     // Start at the root
     if (auto ccode = loadServices(rootPath, (Text) "*")) return ccode;
+
+    // Also scan a `local_nodes` folder under --node_path=<dir>, if given. The
+    // fixed name keeps these imported as local_nodes.<node>, never clashing
+    // with the built-in `nodes` package. setPaths() puts <dir> on sys.path.
+    if (NodePath) {
+        auto localRoot = _cast<file::Path>(*NodePath) / "local_nodes";
+        if (file::exists(localRoot) && file::isDir(localRoot)) {
+            LOG(Services, "Loading workspace-local nodes from", localRoot);
+            if (auto ccode = loadServices(localRoot, (Text) "*")) return ccode;
+        } else {
+            LOG(Services, "No local_nodes directory under --node_path:",
+                _cast<file::Path>(*NodePath));
+        }
+    }
 
     // Update all the fields
     if (auto ccode = updateDefinitions()) return ccode;

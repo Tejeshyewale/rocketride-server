@@ -33,10 +33,14 @@ requests, reviews, releases, workflows, orgs, users, and code search.
 from __future__ import annotations
 
 import base64
+import re
 
-from rocketlib import IInstanceBase, normalize_tool_input, require_int, require_str, tool_function
+from rocketlib import IInstanceBase, tool_function
+
+from ai.common.utils import normalize_tool_input, require_int, require_str
 
 from .github_client import (
+    GitHubAPIError,
     call,
     clean_commit,
     clean_file_entry,
@@ -55,6 +59,105 @@ from .IGlobal import IGlobal
 _REPO_DESC = 'Repository in "owner/repo" format (e.g. "acme/myapp"). Omit to use the configured default.'
 _PER_PAGE_DESC = 'Results per page (1–100, default 30).'
 _PAGE_DESC = 'Page number for pagination (default 1).'
+# Code search and issue search use DIFFERENT GitHub query syntaxes: issue-only qualifiers
+# (is:issue, label:bug, in:title) are not valid for code search, so the two tools advertise
+# different examples.
+_SEARCH_CODE_QUERY_DESC = (
+    'Search keywords — use 2–5 distinct terms, NOT a full sentence. GitHub ANDs every word, so '
+    'long natural-language queries match nothing. Supports code-search qualifiers like '
+    '"language:python", "path:src", "extension:py". Example: "mcp_client transport extension:py".'
+)
+_SEARCH_ISSUES_QUERY_DESC = (
+    'Search keywords — use 2–5 distinct terms, NOT a full sentence. GitHub ANDs every word, so '
+    'long natural-language queries match nothing. Supports issue-search qualifiers like '
+    '"is:issue", "label:bug", "in:title". Example: "dropper browse button is:open".'
+)
+
+# Words stripped from a query before the OR-relax fallback so the relaxed query keeps only
+# meaningful terms (and stays under GitHub's 5 AND/OR/NOT operator limit).
+_SEARCH_STOPWORDS = frozenset(
+    {
+        'a',
+        'an',
+        'the',
+        'is',
+        'are',
+        'was',
+        'were',
+        'be',
+        'been',
+        'being',
+        'i',
+        'im',
+        "i'm",
+        'it',
+        'its',
+        "it's",
+        'this',
+        'that',
+        'to',
+        'of',
+        'in',
+        'on',
+        'for',
+        'with',
+        'and',
+        'or',
+        'but',
+        'if',
+        'when',
+        'my',
+        'me',
+        'you',
+        'having',
+        'issue',
+        'problem',
+        'not',
+        'no',
+        'works',
+        'working',
+        'work',
+        'click',
+        'clicking',
+    }
+)
+
+
+# One search token, keeping quoted qualifier values and quoted phrases whole so a space inside
+# quotes does not split them: -label:"good first issue" | repo:acme/app | "exact phrase" | word
+_QUERY_TOKEN_RE = re.compile(r'-?\w+:"[^"]*"|-?\w+:\S+|"[^"]*"|\S+')
+
+
+def _relax_query(q: str, *, max_terms: int = 5) -> str | None:
+    """Build an OR-relaxed variant of a free-text-heavy query.
+
+    GitHub free-text search ANDs every term, so a verbose natural-language query matches
+    nothing. This keeps GitHub qualifiers (``repo:x``, ``is:issue``, negated ``-label:bug``,
+    and quoted values like ``label:"good first issue"``) intact and OR-joins the remaining
+    keywords. Returns ``None`` when not relaxable (fewer than two usable free-text terms).
+
+    Caps the relaxed query to stay under GitHub's limit of five AND/OR/NOT operators: each
+    OR keyword after the first costs one operator and each qualifier costs one implicit AND,
+    so the keyword count is trimmed to leave room for the qualifiers (never below two).
+    """
+    qualifiers: list[str] = []
+    terms: list[str] = []
+    for tok in _QUERY_TOKEN_RE.findall(q):
+        key = tok.split(':', 1)[0].lstrip('-')
+        if ':' in tok and key and key.isalnum():  # repo:, is:, label:, in:, -label:, ...
+            qualifiers.append(tok)
+            continue
+        word = tok.strip('\'".,!?')
+        if len(word) > 1 and word.lower() not in _SEARCH_STOPWORDS:
+            terms.append(f'"{word}"' if ' ' in word else word)  # re-quote multi-word phrases
+    # de-dup case-insensitively, preserve order
+    seen: set[str] = set()
+    uniq = [t for t in terms if not (t.lower() in seen or seen.add(t.lower()))]
+    if len(uniq) < 2:
+        return None
+    budget = max(2, 6 - len(qualifiers))
+    or_clause = ' OR '.join(uniq[: min(max_terms, budget)])
+    return ' '.join([or_clause, *qualifiers]).strip()
 
 
 class IInstance(IInstanceBase):
@@ -100,16 +203,23 @@ class IInstance(IInstanceBase):
         description='Get the decoded content and metadata of a single file from a GitHub repository.',
     )
     def file_get(self, args):
+        """Get the decoded content and metadata of a single file from a GitHub repository."""
         args = normalize_tool_input(args, tool_name='tool_github')
         repo = self._repo(args)
         path = require_str(args, 'path', tool_name='file_get')
         params = {'ref': args['ref']} if args.get('ref') else None
-        data = call(self._token(), 'GET', f'/repos/{repo}/contents/{path.lstrip("/")}', params=params)
+        try:
+            data = call(self._token(), 'GET', f'/repos/{repo}/contents/{path.lstrip("/")}', params=params)
+        except GitHubAPIError as e:
+            if e.status_code == 404:
+                return {'found': False, 'message': str(e)}
+            raise
         if isinstance(data, list):
             raise ValueError(f'Path "{path}" is a directory — use file_list instead')
         content_b64 = data.get('content', '')
         content = base64.b64decode(content_b64).decode('utf-8', errors='replace')
         return {
+            'found': True,
             'path': data.get('path'),
             'name': data.get('name'),
             'sha': data.get('sha'),
@@ -131,6 +241,7 @@ class IInstance(IInstanceBase):
         description='List files and directories at a path in a GitHub repository.',
     )
     def file_list(self, args):
+        """List files and directories at a path in a GitHub repository."""
         args = normalize_tool_input(args, tool_name='tool_github')
         repo = self._repo(args)
         path = (args.get('path') or '').strip().lstrip('/')
@@ -990,7 +1101,7 @@ class IInstance(IInstanceBase):
             'properties': {
                 'query': {
                     'type': 'string',
-                    'description': 'Search query. Supports GitHub code search syntax (e.g. "mcp_client transport extension:py")',
+                    'description': _SEARCH_CODE_QUERY_DESC,
                 },
                 'repo': {
                     'type': 'string',
@@ -1014,6 +1125,11 @@ class IInstance(IInstanceBase):
             'page': max(1, int(args.get('page') or 1)),
         }
         data = call(self._token(), 'GET', '/search/code', params=params)
+        if not data.get('items'):
+            relaxed = _relax_query(q)
+            if relaxed and relaxed != q:
+                params['q'] = relaxed
+                data = call(self._token(), 'GET', '/search/code', params=params)
         return [
             {
                 'name': item.get('name'),
@@ -1031,7 +1147,7 @@ class IInstance(IInstanceBase):
             'properties': {
                 'query': {
                     'type': 'string',
-                    'description': 'Search query. Supports GitHub issue search syntax (e.g. "mcp timeout is:issue is:open")',
+                    'description': _SEARCH_ISSUES_QUERY_DESC,
                 },
                 'repo': {
                     'type': 'string',
@@ -1058,6 +1174,11 @@ class IInstance(IInstanceBase):
             'page': max(1, int(args.get('page') or 1)),
         }
         data = call(self._token(), 'GET', '/search/issues', params=params)
+        if not data.get('items'):
+            relaxed = _relax_query(q)
+            if relaxed and relaxed != q:
+                params['q'] = relaxed
+                data = call(self._token(), 'GET', '/search/issues', params=params)
         results = []
         for i in data.get('items') or []:
             cleaned = clean_issue(i)

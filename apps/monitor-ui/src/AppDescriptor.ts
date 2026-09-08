@@ -24,9 +24,10 @@
 // MONITOR-UI — App Descriptor
 // =============================================================================
 
-import type { AppDescriptor } from 'shell-ui';
+import React from 'react';
+import type { AppDescriptor } from 'shell';
 import MonitorApp from './MonitorApp';
-import MonitorSidebar from './MonitorSidebar';
+import { RocketRideMark } from 'shell';
 
 /**
  * AppDescriptor for the Server Monitor app.
@@ -39,11 +40,14 @@ const MONITOR_APP: AppDescriptor = {
 	name: 'Server Monitor',
 	branding: {
 		appName: 'Server Monitor',
+		// style fills the shell's sized icon wrapper (the shared mark defaults to a
+		// fixed 24px; width/height:100% preserves the prior fill-to-slot behaviour).
+		iconDark: React.createElement(RocketRideMark, { bodyColor: '#E0DDF0', style: { width: '100%', height: '100%' } }),
+		iconLight: React.createElement(RocketRideMark, { bodyColor: '#1E1A34', style: { width: '100%', height: '100%' } }),
 	},
-	components: {
-		App: MonitorApp,
-		Sidebar: MonitorSidebar,
-	},
+	// Frame-only app: MonitorApp's root AppLayout keeps the branded sidebar
+	// frame (empty slot) and the status bar.
+	app: MonitorApp,
 };
 
 export default MONITOR_APP;

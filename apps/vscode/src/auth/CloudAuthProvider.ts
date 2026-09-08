@@ -43,6 +43,7 @@ export class CloudAuthProvider implements vscode.UriHandler, vscode.Disposable {
 
 	private context: vscode.ExtensionContext | undefined;
 	private pendingVerifier: string | null = null;
+	private pendingGoogleOAuth = new Map<string, (tokens: string, state: string) => void>();
 	private disposables: vscode.Disposable[] = [];
 	private readonly _onDidChange = new EventEmitter();
 
@@ -91,9 +92,81 @@ export class CloudAuthProvider implements vscode.UriHandler, vscode.Disposable {
 		await vscode.env.openExternal(vscode.Uri.parse(authUrl));
 	}
 
+	// --- Node OAuth (Google, Microsoft) ---------------------------------------
+
+	/**
+	 * Registers a one-shot callback to receive node-OAuth tokens once the
+	 * broker's deep link (`/auth/google` or `/auth/microsoft`) returns.
+	 * Waiters are keyed by the node id that started the login (the broker
+	 * echoes it inside `state`), so concurrent logins from different editors
+	 * cannot overwrite or misroute each other. Both providers' consent
+	 * screens can't render in a webview iframe, so the login runs in the
+	 * system browser and returns via this deep link. The registry is shared
+	 * across providers — ProjectProvider arms every node-OAuth login through
+	 * this same call regardless of which provider it targets.
+	 *
+	 * @param nodeId   The pipeline node that initiated the login.
+	 * @param callback Invoked with the raw `tokens` and `state` query strings.
+	 * @return A disposer that unregisters the waiter (call on launch failure).
+	 */
+	setPendingGoogleOAuth(nodeId: string, callback: (tokens: string, state: string) => void): () => void {
+		this.pendingGoogleOAuth.set(nodeId, callback);
+		return () => {
+			this.pendingGoogleOAuth.delete(nodeId);
+		};
+	}
+
+	private handleProviderOAuth(uri: vscode.Uri, provider: 'google' | 'microsoft'): void {
+		const label = provider === 'google' ? 'Google' : 'Microsoft';
+		const params = new URLSearchParams(uri.query);
+		const error = params.get('oauth_error') || params.get('error');
+		const tokens = params.get('tokens');
+		const state = params.get('state') ?? '';
+
+		// The broker echoes the originating node_id inside the state JSON; use
+		// it to pick the matching waiter. Fall back to a sole waiter for broker
+		// responses without one, and reject when the target is ambiguous.
+		let nodeId: string | undefined;
+		try {
+			nodeId = (JSON.parse(state || '{}') as { node_id?: string }).node_id;
+		} catch {
+			/* malformed state, resolved below */
+		}
+		let callback = nodeId ? this.pendingGoogleOAuth.get(nodeId) : undefined;
+		if (callback) {
+			this.pendingGoogleOAuth.delete(nodeId as string);
+		} else if (!nodeId && this.pendingGoogleOAuth.size === 1) {
+			const [soleKey, soleCallback] = this.pendingGoogleOAuth.entries().next().value as [string, (tokens: string, state: string) => void];
+			this.pendingGoogleOAuth.delete(soleKey);
+			callback = soleCallback;
+		}
+
+		if (error) {
+			vscode.window.showErrorMessage(`${label} sign-in failed: ${params.get('error_description') || error}`);
+			return;
+		}
+		if (!tokens) {
+			vscode.window.showErrorMessage(`${label} sign-in failed: no tokens received.`);
+			return;
+		}
+		if (!callback) {
+			vscode.window.showWarningMessage(`${label} sign-in completed, but no pipeline editor was waiting for it.`);
+			return;
+		}
+		callback(tokens, state);
+	}
+
 	// --- URI Handler ---------------------------------------------------------
 
 	async handleUri(uri: vscode.Uri): Promise<void> {
+		if (uri.path === '/auth/google') {
+			this.handleProviderOAuth(uri, 'google');
+			return;
+		}
+		if (uri.path === '/auth/microsoft') {
+			this.handleProviderOAuth(uri, 'microsoft');
+			return;
+		}
 		if (uri.path !== '/auth/callback') return;
 
 		const params = new URLSearchParams(uri.query);

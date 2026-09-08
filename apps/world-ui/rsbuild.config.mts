@@ -24,10 +24,14 @@ export default defineConfig(() => {
 					'./AppDescriptor': './src/AppDescriptor.ts',
 				},
 				dts: false,
-				// runtime: false — the host (shell-ui) provides the MF runtime;
+				// runtime: false — the host (the shell) provides the MF runtime;
 				// remotes don't embed their own copy, keeping remoteEntry.js
 				// stable across app-code-only rebuilds.
 				runtime: false,
+				// loaded-first: use the host's already-loaded shared instances instead of
+				// version-first's boot-time download of EVERY registered remoteEntry.js
+				// just to compare shared versions (everything here is singleton + co-deployed).
+				shareStrategy: 'loaded-first',
 				shared: {
 					// eager: true makes shared-scope negotiation synchronous on
 					// both host and remote, eliminating the async deadlock that
@@ -35,16 +39,18 @@ export default defineConfig(() => {
 					react: { singleton: true, eager: true, requiredVersion: '^18.2.0' },
 					'react-dom': { singleton: true, eager: true, requiredVersion: '^18.2.0' },
 					// import: false — host always provides these, no fallback needed.
-					'shell-ui': { singleton: true, requiredVersion: false, import: false },
-					'shared':   { singleton: true, requiredVersion: false, import: false },
+					'shell': { singleton: true, requiredVersion: false, import: false },
+					'rocketride': { singleton: true, requiredVersion: false, import: false },
 				},
 			}),
 		],
 		// No resolve aliases — all shared modules resolve through node_modules
 		// and MF provides the host's singleton at runtime.
-		resolve: {
-		},
-		server: { port: 3014 },
+		resolve: {},
+		// CORS: explicitly allow any origin — the serving host isn't fixed, so no
+		// allowlist is possible; declaring it also stops the MF plugin injecting
+		// its own wildcard defaults (and warning about it).
+		server: { port: 3014, cors: { origin: '*' } },
 		source: {
 			entry: {
 				index: './src/index.ts',

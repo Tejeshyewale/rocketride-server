@@ -13,12 +13,36 @@ communication with their respective APIs.
 import time
 import json
 import importlib
-from typing import Dict, Any
-from rocketlib import debug
+from typing import Dict, Any, Callable, Optional
+from rocketlib import debug, warning
 from ai.common.schema import Answer, Question
 from ai.common.config import Config
-from ai.common.util import parseJson
-from ai.common.validation import validate_model_name, validate_max_tokens, validate_prompt
+from ai.common.util import ThinkTruncatedError, parseJson
+from ai.common.validation import (
+    validate_model_name,
+    validate_max_tokens,
+    validate_prompt,
+    check_output_token_config,
+    hand_supplied_token_fields,
+)
+from ai.common.llm_native_stream import STOP_SEQUENCES_VAR, dispatch_native_chat_stream
+from ai.common.llm_adapter import LangChainAdapter, NativeOpenAIResponsesAdapter, drive_adapter
+
+
+def _stop_kwargs() -> dict:
+    """Return ``{'stop': [...]}`` only when stop sequences are active for this call.
+
+    Passing ``stop=`` unconditionally (even ``stop=None``) breaks model backends and
+    test mocks whose ``invoke``/``stream`` signature does not accept a ``stop`` kwarg, so
+    the argument is omitted entirely for the common no-stop path.
+
+    INVARIANT: this is read within the synchronous ``ask()`` call, while
+    ``LLMBase._question`` still holds the contextvar (before its ``finally`` reset).
+    Do not defer consumption (e.g. by returning a lazy generator to the caller) —
+    the value would then read ``None`` after the reset and silently send no stop.
+    """
+    stop = STOP_SEQUENCES_VAR.get()
+    return {'stop': stop} if stop else {}
 
 
 class ChatBase:
@@ -39,6 +63,20 @@ class ChatBase:
         _model (str): The model identifier/name being used
         _modelTotalTokens (int): Maximum tokens the model can handle in total
     """
+
+    # Reasoning capability from services.json (capabilities.reasoning), stamped by
+    # the model sync. Read once in __init__ so no driver has to.
+    _is_reasoning: bool = False
+    # Opt-in: subclass sets True + sets self._raw_client to route through the
+    # OpenAI Responses API for reasoning-summary streaming.
+    SUPPORTS_REASONING_STREAMING: bool = False
+    _raw_client = None
+
+    # Native stream handler key, set by non-OpenAI drivers (e.g. Anthropic);
+    # left empty for OpenAI-compatible drivers, which ChatBase auto-wires.
+    _native_stream_provider: str = ''
+    # Raw openai SDK client for the generic reasoning handler; built lazily by ChatBase.
+    _raw_openai_client = None
 
     def __init__(self, provider: str, connConfig: Dict[str, Any], bag: Dict[str, Any]):
         """
@@ -67,6 +105,21 @@ class ChatBase:
         self._modelTotalTokens = config.get('modelTotalTokens', 16384)  # Default to 16K if not specified
         self._modelOutputTokens = config.get('modelOutputTokens', 4096)  # Default to 4K if not specified
 
+        # Check what the author wrote, before the clamp below rewrites it — a value the
+        # provider would reject can be clamped into a plausible-looking one, and then
+        # there is nothing left to report. Only when a token field was hand-supplied:
+        # catalogue profiles are checked by the model sync, and warning about those on
+        # every run would be noise. Hand-written config is what the sync never sees.
+        if hand_supplied_token_fields(connConfig):
+            problem = check_output_token_config(
+                self._model,
+                self._modelOutputTokens,
+                self._modelTotalTokens,
+                Config.getNodeProfiles(provider),
+            )
+            if problem:
+                warning(f'{provider}: {problem}')
+
         # Validate and clamp output tokens against known safe maximums
         self._modelOutputTokens = validate_max_tokens(self._modelOutputTokens, self._modelTotalTokens)
 
@@ -79,6 +132,31 @@ class ChatBase:
         debug(f'    Model                    : {self._model}')
         debug(f'    Total tokens             : {self._modelTotalTokens}')
         debug(f'    Output tokens            : {self._modelOutputTokens}')
+
+        # Reasoning capability comes from services.json (stamped by the model sync).
+        self._is_reasoning = bool((config.get('capabilities') or {}).get('reasoning'))
+
+    def _ensure_openai_compat_reasoning_stream(self) -> None:
+        """Lazily build the raw openai client used to stream reasoning for
+        OpenAI-compatible drivers (built here, since _llm exists after super().__init__).
+        """
+        if self._native_stream_provider or self._raw_openai_client is not None:
+            return
+        if not self._is_reasoning:
+            return
+        llm = getattr(self, '_llm', None)
+        base_url = getattr(llm, 'openai_api_base', None)
+        if llm is None or not base_url:
+            return  # not an OpenAI-compatible driver (e.g. plain OpenAI, Anthropic)
+        key = getattr(llm, 'openai_api_key', None)
+        api_key = key.get_secret_value() if hasattr(key, 'get_secret_value') else key
+        try:
+            from openai import OpenAI
+
+            self._raw_openai_client = OpenAI(api_key=api_key, base_url=str(base_url))
+            self._native_stream_provider = 'openai_compat_reasoning'
+        except Exception as e:  # openai SDK missing / bad client → fall back to generic stream
+            debug(f'    Native reasoning stream unavailable: {type(e).__name__}: {e}')
 
     def getTotalTokens(self) -> int:
         """
@@ -127,11 +205,10 @@ class ChatBase:
             Should raise appropriate exceptions for API failures, authentication
             errors, or other provider-specific issues
         """
-        # Ask the LLM
-        results = self._llm.invoke(prompt)
-
-        # Return the results
-        return results.content
+        # Non-streaming: invoke through the adapter — same shared normalization as streaming,
+        # but a genuinely different mechanism, so the streaming fallback can still recover.
+        text, _items = LangChainAdapter(self._llm, stream_kwargs=_stop_kwargs()).collect(prompt)
+        return text
 
     def getTokens(self, value: str) -> int:
         """
@@ -310,6 +387,10 @@ class ChatBase:
                     # Non-retryable error or max retries reached
                     debug(f'Chat failed after {attempt + 1} attempts: {str(e)}')
 
+                    # Surface the raw provider message in the UI Errors tab
+                    # before map_exception() collapses it into a vaguer ValueError.
+                    warning(f'Chat failed for model={self._model} ({type(e).__name__}): {e}')
+
                     # Map to a friendlier exception if possible
                     raise self.map_exception(e)
 
@@ -326,35 +407,55 @@ class ChatBase:
         # This should never be reached due to the raise in the loop
         raise Exception('Unexpected exit from retry loop')
 
-    def chat_string(self, prompt: str) -> str:
+    def _chat_string_responses(
+        self,
+        prompt: str,
+        on_chunk: Optional[Callable[[str], None]] = None,
+        on_finish: Optional[Callable[[Optional[str]], None]] = None,
+        on_reasoning_chunk: Optional[Callable[[str], None]] = None,
+        emitted: Optional[Dict[str, bool]] = None,
+    ) -> str:
+        """Stream the answer and reasoning summary via the OpenAI Responses API,
+        falling back to non-streaming invoke() only if nothing reached the UI yet.
         """
-        Invoke the chat interface with string input, token management, and network retry handling.
+        prompt = validate_prompt(prompt, self._modelTotalTokens, self.getTokens)
+        try:
+            adapter = NativeOpenAIResponsesAdapter(self)
+            text, _items = drive_adapter(adapter, prompt, on_chunk, on_reasoning_chunk)
+            if not text:
+                # No text (e.g. response.failed) → route to the fallback below, like the Anthropic path.
+                raise RuntimeError('OpenAI Responses stream produced no text')
+            if on_finish is not None:
+                on_finish(adapter.finish_reason)
+            return text
+        except Exception as e:
+            warning(f'Reasoning streaming disabled for model={self._model} ({type(e).__name__}): {e}.')
+            # Only retry non-streaming if nothing reached the UI; otherwise the full
+            # fallback would arrive on top of the partial we already streamed.
+            if emitted is None or not emitted['any']:
+                adapter = LangChainAdapter(self._llm, stream_kwargs=_stop_kwargs())
+                content_text, _items = adapter.collect(prompt)
+                # Reasoning reaches its own lane; it must never land in the visible text.
+                if adapter.reasoning and on_reasoning_chunk is not None:
+                    on_reasoning_chunk(adapter.reasoning)
+                if content_text and on_chunk is not None:
+                    on_chunk(content_text)
+                if on_finish is not None:
+                    on_finish('stop')
+                return content_text
+            if on_finish is not None:
+                on_finish('error')
+            return ''
 
-        This is the main entry point for chat operations using raw string prompts.
-        It handles token counting, limit checking, network retries, and provides
-        warnings for potential issues like truncation.
-
-        The method performs the following steps:
-        1. Count tokens in the input prompt
-        2. Check if prompt exceeds safe limits
-        3. Call the provider-specific chat implementation with retry logic
-        4. Count tokens in the response
-        5. Check for potential truncation
-        6. Return the result
-
-        Args:
-            prompt (str): The complete prompt to send to the model
-
-        Returns:
-            str: The model's response
-
-        Warnings:
-            - Issues debug warning if prompt is too long
-            - Issues debug warning if response appears truncated
-
-        Raises:
-            Exception: If network/API retries are exhausted or non-retryable
-                      errors occur
+    def chat_string(
+        self,
+        prompt: str,
+        on_chunk: Optional[Callable[[str], None]] = None,
+        on_finish: Optional[Callable[[Optional[str]], None]] = None,
+        on_reasoning_chunk: Optional[Callable[[str], None]] = None,
+    ) -> str:
+        """Run a string prompt with token checks and retry; when callbacks are given,
+        stream visible/reasoning deltas as they arrive. Returns the full answer.
         """
         # Validate and sanitize the prompt before processing
         prompt = validate_prompt(prompt, self._modelTotalTokens, self.getTokens)
@@ -371,9 +472,83 @@ class ChatBase:
                 f'Warning: Prompt ({prompt_tokens} tokens) exceeds input allocation ({self._modelTotalTokens} tokens)'
             )
 
+        # True once visible text reached the UI; fallback then skips the non-stream
+        # retry to avoid duplication. Only on_chunk flips it (not reasoning).
+        emitted = {'any': False}
+
+        if on_chunk is None:
+            on_chunk_w = None
+        else:
+
+            def on_chunk_w(t):
+                emitted['any'] = True
+                on_chunk(t)
+
+        on_reasoning_chunk_w = on_reasoning_chunk
+
+        # Responses API path for opt-in reasoning models (OpenAI o-series / gpt-5).
+        if (
+            self.SUPPORTS_REASONING_STREAMING
+            and self._is_reasoning
+            and self._raw_client is not None
+            and hasattr(self._raw_client, 'responses')
+        ):
+            return self._chat_string_responses(
+                prompt,
+                on_chunk=on_chunk_w,
+                on_finish=on_finish,
+                on_reasoning_chunk=on_reasoning_chunk_w,
+                emitted=emitted,
+            )
+
+        # Provider-native streaming (generic openai_compat reasoning, Anthropic extended thinking).
+        if on_chunk is not None:
+            # Auto-wire the generic OpenAI-compatible reasoning stream from config
+            # (no per-provider code). Special-case drivers already set their handler.
+            self._ensure_openai_compat_reasoning_stream()
+            native_text = dispatch_native_chat_stream(self, prompt, on_chunk_w, on_finish, on_reasoning_chunk_w)
+            if native_text is not None:
+                result_tokens = self.getTokens(native_text)
+                if prompt_tokens + result_tokens >= self._modelTotalTokens - 5:
+                    debug(f'Warning: Result ({result_tokens} tokens) was probably truncated')
+                return native_text
+            # Native handler returned None after emitting chunks: don't restart
+            # the request through a different path, just close with an error.
+            if emitted['any']:
+                if on_finish is not None:
+                    on_finish('error')
+                return ''
+
+        _llm = getattr(self, '_llm', None)
+
         # Call the chat implementation with network retry logic
         # This is where the real communication with the AI provider happens
-        result = self._chat_with_retries(prompt)
+        # Use chat_string when a per-token callback is provided; .stream() if available, else fall back.
+        result = None
+        if on_chunk_w is not None and _llm is not None and hasattr(_llm, 'stream'):
+            try:
+                # Stream the LangChain path through the normalized adapter; drive_adapter
+                # fans text/thinking to the callbacks and returns the joined answer.
+                adapter = LangChainAdapter(_llm, stream_kwargs=_stop_kwargs())
+                answer, _items = drive_adapter(adapter, prompt, on_chunk_w, on_reasoning_chunk_w)
+                if answer:
+                    result = answer
+                    if on_finish is not None:
+                        on_finish(adapter.finish_reason)
+            except Exception as e:
+                warning(
+                    f'Streaming disabled for model={self._model} '
+                    f'({type(e).__name__}): {e}. Falling back to non-streaming response.'
+                )
+        if result is None:
+            # If anything already reached the UI we can't restart the request
+            # (would duplicate content); close with an error and return partials.
+            if emitted['any']:
+                if on_finish is not None:
+                    on_finish('error')
+                result = ''
+            else:
+                result = self._chat_with_retries(prompt)
 
         # Count tokens in the response to check for potential truncation
         # This helps identify cases where the model's response was cut off
@@ -388,33 +563,26 @@ class ChatBase:
         # Return the model's response
         return result
 
-    def chat(self, question: Question) -> Answer:
+    def chat(
+        self,
+        question: Question,
+        on_chunk: Optional[Callable[[str], None]] = None,
+        on_finish: Optional[Callable[[Optional[str]], None]] = None,
+        on_reasoning_chunk: Optional[Callable[[str], None]] = None,
+    ) -> Answer:
+        """Chat with Question/Answer objects (JSON validation + retry); forwards the
+        streaming callbacks unless expectJson, which needs the validated final answer.
         """
-        Chat using structured Question/Answer objects with JSON validation and network retry handling.
+        # No streaming for expectJson: repair retries would paint a bad first attempt.
+        stream_cbs = (None, None, None) if question.expectJson else (on_chunk, on_finish, on_reasoning_chunk)
 
-        This method provides a robust interface that works with the application's
-        schema objects. It handles network failures, rate limits, and other
-        transient errors by retrying the request with exponential backoff.
-
-        If the question expects JSON output, this method will also validate the
-        response and retry with additional instructions if the JSON is invalid.
-
-        Args:
-            question (Question): A Question object containing the prompt and
-                               metadata (e.g., whether JSON output is expected)
-
-        Returns:
-            Answer: An Answer object containing the response and preserving
-                   the original question's metadata
-
-        Raises:
-            ValueError: If expectJson is True and valid JSON cannot be obtained
-                       after multiple retry attempts
-            Exception: If network/API retries are exhausted or non-retryable
-                      errors occur
-        """
         # Use chat_string which already handles network retries and token management
-        response = self.chat_string(question.getPrompt())
+        response = self.chat_string(
+            question.getPrompt(),
+            on_chunk=stream_cbs[0],
+            on_finish=stream_cbs[1],
+            on_reasoning_chunk=stream_cbs[2],
+        )
 
         # If JSON output is expected, validate the response and retry if needed.
         # Store the parsed result so setAnswer receives a dict/list directly —
@@ -433,7 +601,19 @@ class ChatBase:
                     answer.setAnswer(parsed_response)
                     return answer
 
-                except (json.JSONDecodeError, ValueError):
+                # Listed before the generic arm below, which would otherwise swallow it —
+                # ThinkTruncatedError IS a ValueError.
+                except ThinkTruncatedError as e:
+                    # Not a formatting mistake: the model never reached the JSON because it
+                    # ran out of output budget mid-reasoning. The repair prompt tells it to
+                    # "examine your JSON", which is the wrong instruction, and a resample
+                    # rarely fits a budget that has already overflowed. So surface the cause
+                    # now instead of buying two more model calls to arrive at a message that
+                    # no longer names it.
+                    debug(f'Error: {e}')
+                    raise
+
+                except (json.JSONDecodeError, ValueError) as e:
                     # JSON parsing failed
                     if retry_count < max_retries - 1:
                         debug(f'JSON validation failed on attempt {retry_count + 1}, retrying...')
@@ -442,10 +622,15 @@ class ChatBase:
                         # This will again use chat_string with full network retry logic
                         response = self.chat_string(question.getPrompt(has_previous_json_failed=True))
                     else:
-                        # Max retries reached, raise ValueError
-                        error_msg = f'Failed to get valid JSON response after {max_retries + 1} attempts. Last response: {response[:200]}...'
+                        # Max retries reached, raise ValueError. Carry the last parse error:
+                        # without it the caller sees only a truncated response and has to
+                        # guess what was wrong with it.
+                        error_msg = (
+                            f'Failed to get valid JSON response after {max_retries + 1} attempts. '
+                            f'Cause: {e}. Last response: {response[:200]}...'
+                        )
                         debug(f'Error: {error_msg}')
-                        raise ValueError(error_msg)
+                        raise ValueError(error_msg) from e
 
         else:
             # Create the answer and assign the text

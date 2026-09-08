@@ -12,14 +12,14 @@ A complete guide for developers building micro-frontend applications for the Roc
    - [Monorepo App (saas workspace)](#monorepo-app-saas-workspace)
 3. [The App Manifest](#the-app-manifest)
 4. [The App Descriptor](#the-app-descriptor)
-5. [Shell Props — What Your App Receives](#shell-props--what-your-app-receives)
+5. [Shell Props: What Your App Receives](#shell-props-what-your-app-receives)
 6. [Screen Zones](#screen-zones)
 7. [Shell Hooks & APIs](#shell-hooks--apis)
 8. [The Connection Manager (connectionManager)](#the-connection-manager-connectionmanager)
 9. [The Documents System](#the-documents-system)
 10. [The Virtual File System (IVirtualFileSystem)](#the-virtual-file-system-ivirtualfilesystem)
-11. [DocExplorer — File Tree Component](#docexplorer--file-tree-component)
-12. [DocTabs — Tab Bar Component](#doctabs--tab-bar-component)
+11. [DocExplorer: File Tree Component](#docexplorer-file-tree-component)
+12. [DocTabs: Tab Bar Component](#doctabs-tab-bar-component)
 13. [Cross-App Component Loading](#cross-app-component-loading)
 14. [Theming](#theming)
 15. [Build Configuration](#build-configuration)
@@ -60,12 +60,12 @@ The shell mounts two components from your app:
 
 ## Getting Started
 
-There are two ways to build a shell-ui app:
+There are two ways to build a shell app:
 
-1. **Standalone** — your own repo, `npm install rocketride`, deploy to any shell-ui host
-2. **Monorepo** — inside the `saas` workspace, using `shell-ui` and `shared` directly
+1. **Standalone**: your own repo, `npm install rocketride`, deploy to any shell host
+2. **Monorepo**: inside the `saas` workspace, using `shell` and `shared` directly
 
-Both produce the same output: a Module Federation remote with an `AppDescriptor` export. The app code is identical — only the project setup differs.
+Both produce the same output: a Module Federation remote with an `AppDescriptor` export. The app code is identical, only the project setup differs.
 
 ---
 
@@ -229,9 +229,9 @@ Deploy the contents of `./dist/` to your hosting provider. The shell loads your 
 
 | | Standalone | Monorepo |
 |---|---|---|
-| **Import types from** | `rocketride/app-sdk` | `shell-ui` |
-| **Install** | `npm install rocketride` | `shell-ui: workspace:~` |
-| **MF shared** | `rocketride/app-sdk` | `shell-ui` + `shared` |
+| **Import types from** | `rocketride/app-sdk` | `shell` (surface) + `rocketride` (SDK) |
+| **Install** | `npm install rocketride` | workspace link (`shell` override) + `rocketride: workspace:*` |
+| **MF shared** | `rocketride/app-sdk` | `shell` + `rocketride` |
 | **Build** | `npx rsbuild build` | `./builder my-app:build` |
 | **Deploy** | Upload `dist/` to CDN | Builder copies to server static |
 
@@ -271,19 +271,27 @@ apps/my-app/
     "categories": ["tools"]
   },
   "dependencies": {
-    "@module-federation/rsbuild-plugin": "^0.9.0",
-    "shell-ui": "workspace:~",
+    "@module-federation/rsbuild-plugin": "^2.5.1",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "shared": "workspace:~"
+    "rocketride": "workspace:*",
+    "shell": "file:../../.rocketride/shell/shell.tgz"
   }
 }
 ```
 
-#### 3. AppDescriptor — import from `shell-ui`
+The `shell` spec stays in the portable `file:` form so the app can be lifted
+into its own repo unchanged; inside the monorepo, the workspace root's
+`overrides: { shell: 'workspace:*' }` resolves it to the in-tree platform
+package instead — a plain link, so fresh clones and CI install without any
+prebuilt artifact. `rocketride` is the SDK door: import protocol classes,
+enums, constants, and API types from it. Client *instances* still come only
+from `useShellConnection()` — the shell owns the connection.
+
+#### 3. AppDescriptor: import from `shell`
 
 ```typescript
-import type { AppDescriptor } from 'shell-ui';
+import type { AppDescriptor } from 'shell';
 import MyApp from './MyApp';
 import MySidebar from './MySidebar';
 
@@ -300,11 +308,11 @@ const MY_APP: AppDescriptor = {
 export default MY_APP;
 ```
 
-#### 4. App and Sidebar — same as standalone
+#### 4. App and Sidebar: same as standalone
 
 ```typescript
-// MyApp.tsx — import from 'shell-ui' instead of 'rocketride/app-sdk'
-import type { ShellAppProps } from 'shell-ui';
+// MyApp.tsx — import from 'shell' instead of 'rocketride/app-sdk'
+import type { ShellAppProps } from 'shell';
 ```
 
 #### 5. Add to workspace and build
@@ -351,7 +359,7 @@ module.exports = {
 
 #### Monorepo-only: rsbuild.config.ts
 
-The monorepo version adds `shared` to the MF config and uses path aliases:
+The monorepo version consumes `shell` and `rocketride` as host-provided MF singletons (`import: false` — nothing bundled; the `shared` library is static and needs no share entry):
 
 ```typescript
 import fs from 'node:fs';
@@ -374,17 +382,13 @@ export default defineConfig(() => ({
       shared: {
         react:       { singleton: true, eager: true, requiredVersion: '^18.2.0' },
         'react-dom': { singleton: true, eager: true, requiredVersion: '^18.2.0' },
-        'shell-ui':  { singleton: true, requiredVersion: false },
-        'shared':    { singleton: true, requiredVersion: false },
+        // import: false — the host always provides these at runtime, so no
+        // fallback copy is bundled into the remote.
+        'shell':      { singleton: true, requiredVersion: false, import: false },
+        'rocketride': { singleton: true, requiredVersion: false, import: false },
       },
     }),
   ],
-  resolve: {
-    alias: {
-      shared: path.resolve(__dirname, '../../rocketride-server/packages/shared-ui/src'),
-      'shell-ui': path.resolve(__dirname, '../../rocketride-server/apps/shell-ui/src/index.ts'),
-    },
-  },
   server: { port: 3014 },
   source: { entry: { index: './src/index.ts' } },
   output: {
@@ -400,7 +404,7 @@ export default defineConfig(() => ({
 
 ## The App Manifest
 
-Declared in `package.json` under the `appManifest` key. This metadata is available at boot without loading the app bundle — used for the app store, authentication gating, and settings.
+Declared in `package.json` under the `appManifest` key. This metadata is available at boot without loading the app bundle, used for the app store, authentication gating, and settings.
 
 ```typescript
 interface AppManifest {
@@ -426,6 +430,12 @@ interface AppManifest {
   showStatusBar?: boolean;
   /** Settings the app requires. Shown in the shell's Settings overlay. */
   settings?: AppSettingDefinition[];
+  /** Internal: MF module identifier (derived from id). */
+  moduleId?: string;
+  /** App lifecycle status (e.g. 'auth', 'free', 'unsubscribed', 'subscribed', 'trialing', 'past_due', 'canceled'). */
+  appStatus?: string;
+  /** Whether the app is available on the desktop (non-cloud) platform. */
+  onDesktop?: boolean;
 }
 ```
 
@@ -451,7 +461,7 @@ Apps can declare runtime settings (API keys, config values) that the shell manag
 Settings are:
 - Rendered in the shell's Settings overlay (grouped by app)
 - Persisted to `.workspace/settings.json`
-- Available to your app via `useShellApiConfig()` — access as `config.MY_API_KEY`
+- Available to your app via `useShellApiConfig()`, access as `config.MY_API_KEY`
 
 ---
 
@@ -494,20 +504,20 @@ interface ShellBrandingConfig {
 }
 ```
 
-**Icon resolution order** — the shell picks the best icon for the sidebar header:
+**Icon resolution order**: the shell picks the best icon for the sidebar header:
 1. `iconDark` / `iconLight` (matched to the active palette mode)
 2. `icon` (generic branding icon)
 3. Manifest `icon` URL (from `package.json`)
 4. 2-letter monogram fallback
 
-Pre-built theme-aware SVGs are available in `shared-ui/assets/rocketride/`:
-- `rocketride-dark.svg` — light body (`#E0DDF0`) for dark backgrounds
-- `rocketride-light.svg` — dark body (`#1E1A34`) for light backgrounds
-- `rocketride.svg` — `currentColor` body, CSS-controlled
+Pre-built theme-aware SVGs are available in `shared/assets/rocketride/`:
+- `rocketride-dark.svg`: light body (`#E0DDF0`) for dark backgrounds
+- `rocketride-light.svg`: dark body (`#1E1A34`) for light backgrounds
+- `rocketride.svg`: `currentColor` body, CSS-controlled
 
 ---
 
-## Shell Props — What Your App Receives
+## Shell Props: What Your App Receives
 
 ### ShellAppProps (your App component)
 
@@ -543,16 +553,16 @@ When `collapsed` is true, hide your sidebar content or show only icons.
 | **Status Bar** | Shell | Connection status, app name, ready state |
 | **Overlays** | Shell | Account, Billing, Settings (triggered from sidebar footer) |
 
-If your app omits `components.Sidebar`, the sidebar zone is hidden entirely — your app gets the full window width.
+If your app omits `components.Sidebar`, the sidebar zone is hidden entirely, your app gets the full window width.
 
 ---
 
 ## Shell Hooks & APIs
 
-Import everything from `'shell-ui'`:
+Import everything from `'shell'`:
 
 ```typescript
-import { useShellConnection, useShellApiConfig, useWorkspace, connectionManager } from 'shell-ui';
+import { useShellConnection, useShellApiConfig, useWorkspace, connectionManager } from 'shell';
 ```
 
 ### Connection
@@ -578,28 +588,36 @@ import { useShellConnection, useShellApiConfig, useWorkspace, connectionManager 
 | `useWorkspace()` | `IWorkspaceContext` | Access workspace state and dispatch |
 
 The workspace context provides:
-- `seeded` — True once pre-auth default state has been populated (before connection)
-- `loaded` — True once persisted workspace state has been read from disk (after connection)
-- `prefs` — Current app preferences (theme, active view, etc.)
-- `appState` — Opaque per-app state (used by Documents)
-- `settings` — User-configured settings
-- `activeAppId` — Current app ID
-- `appManifest` — All registered apps
-- `dispatch(action)` — Update prefs or switch apps
-- `emit(event, payload)` / `on(event, handler)` — Event bus (delegates to connectionManager)
+- `seeded`: True once pre-auth default state has been populated (before connection)
+- `loaded`: True once persisted workspace state has been read from disk (after connection)
+- `prefs`: Current app preferences (theme, active view, etc.)
+- `appState`: Opaque per-app state (used by Documents)
+- `settings`: User-configured settings
+- `activeAppId`: Current app ID
+- `appManifest`: All registered apps
+- `appLoading`: Whether the active app is currently loading
+- `loadedApps`: Map of already-loaded app descriptors (for cross-app component loading)
+- `loadApp(appId)`: Trigger lazy loading of an app's descriptor
+- `updateAppState(patch)`: Update per-app state
+- `updateSetting(key, value)`: Update a single setting
+- `updatePrefs(patch)`: Update workspace preferences
+- `themeOptions`: Available theme choices
+- `setTheme(themeId)`: Switch the active theme
+- `dispatch(action)`: Update prefs or switch apps
+- `emit(event, payload)` / `on(event, handler)`: Event bus (delegates to connectionManager)
 
 ### Workspace Lifecycle: `seeded` vs `loaded`
 
 The workspace has a two-phase startup:
 
-1. **Seeded** (`seeded = true`, `loaded = false`) — The workspace has been populated with hardcoded defaults (default prefs, empty appState, empty settings). This happens immediately, before authentication or WebSocket connection. The Shell renders at this point so unauthenticated apps (e.g. home/landing page) can display.
+1. **Seeded** (`seeded = true`, `loaded = false`): The workspace has been populated with hardcoded defaults (default prefs, empty appState, empty settings). This happens immediately, before authentication or WebSocket connection. The Shell renders at this point so unauthenticated apps (e.g. home/landing page) can display.
 
-2. **Loaded** (`seeded = true`, `loaded = true`) — The WebSocket is connected and persisted state has been read from disk (`.workspace/global.json`, per-app workspace files, `settings.json`). Persisted prefs, appState, and settings overwrite the seeded defaults. Debounced persistence (auto-save) only activates after this point.
+2. **Loaded** (`seeded = true`, `loaded = true`): The WebSocket is connected and persisted state has been read from disk (`.workspace/global.json`, per-app workspace files, `settings.json`). Persisted prefs, appState, and settings overwrite the seeded defaults. Debounced persistence (auto-save) only activates after this point.
 
 **What this means for your app:**
 
 - The **Shell** renders as soon as `seeded` is true. It is then up to each app to decide whether it needs to wait for `loaded`.
-- **Unauthenticated apps** (`authenticated: false`) can render immediately on seeded state — they receive `isConnected=false` and `identity=null` and should be designed to work with those values.
+- **Unauthenticated apps** (`authenticated: false`) can render immediately on seeded state, they receive `isConnected=false` and `identity=null` and should be designed to work with those values.
 - **Authenticated apps** that depend on persisted settings (API keys, saved state) should gate on `loaded` before rendering data-dependent UI:
 
 ```typescript
@@ -611,18 +629,18 @@ if (!loaded) return <div>Loading workspace…</div>;
 const apiKey = settings.MY_API_KEY;
 ```
 
-- **Persistence is safe** — debounced saves to disk only fire when `loaded` is true, so seeded defaults are never accidentally written over persisted data.
+- **Persistence is safe**: debounced saves to disk only fire when `loaded` is true, so seeded defaults are never accidentally written over persisted data.
 
 ---
 
 ## The Connection Manager (connectionManager)
 
-A typed, module-level event bus singleton. Works from React components, hooks, plain functions — anywhere.
+A typed, module-level event bus singleton. Works from React components, hooks, plain functions, anywhere.
 
 ### Basic usage
 
 ```typescript
-import { connectionManager } from 'shell-ui';
+import { connectionManager } from 'shell';
 
 // Emit an event
 connectionManager.emit('shell:loginRequest', { appId: 'rocketride.myApp' });
@@ -658,12 +676,15 @@ useEffect(() => {
 | `shell:loginRequest` | `{ appId?: string }` | Apps → Shell | Request OAuth login (optionally targeting an app) |
 | `shell:logoutRequest` | `{}` | Apps → Shell | Request logout |
 | `shell:switchApp` | `{ appId: string }` | Apps → Shell | Switch the active app |
-| `shell:subscribe` | `{ app: AppManifestEntry }` | Apps → Shell | Open subscription checkout for an app |
+| `shell:subscribe` | `{ app: AppManifestEntry, plan?: CheckoutPlan }` | Apps → Shell | Open subscription checkout for an app; optional `plan` preselects a tier and skips the picker (straight to payment) |
 | `shell:myApps` | `{}` | Apps → Shell | Navigate to My Apps |
 | `shell:accountUpdate` | `ConnectResult` | Server → Shell | Server-pushed account/subscription change |
+| `shell:servicesUpdated` | `{ services: Record<string, unknown>; servicesError?: string }` | Shell → Apps | Service catalog fetch completed |
 | `shell:sidebarCollapsing` | `{}` | Shell → Apps | Sidebar is collapsing (for layout adjustments) |
 | `shell:themeChange` | `{ tokens: Record<string, string> }` | Shell → Apps | Theme CSS tokens changed |
-| `shell:statusChange` | `{ message: string \| null }` | Shell → Apps | Status bar message update |
+| `shell:statusMessage` | `{ message: string \| null }` | Shell → Apps | Transient status bar text changed |
+| `shell:statusChange` | `{ connected: boolean; ... }` | Shell → Apps | Full connection state machine update |
+| `shell:error` | `{ error: Error \| unknown }` | Shell → Apps | Connection or operation error |
 | `shell:event` | `{ event: unknown }` | Server → Apps | Raw server event forwarded from WebSocket |
 
 ### Extending the event map
@@ -671,7 +692,7 @@ useEffect(() => {
 Add custom events via TypeScript module augmentation:
 
 ```typescript
-declare module 'shell-ui' {
+declare module 'shell' {
   interface ShellEventMap {
     'myapp:dataUpdated': { recordId: string; timestamp: number };
     'myapp:exportComplete': { fileUrl: string };
@@ -687,7 +708,7 @@ connectionManager.emit('myapp:dataUpdated', { recordId: '123', timestamp: Date.n
 All events are automatically captured in a circular buffer (500 entries) visible in the Debug Panel (ALT+D).
 
 ```typescript
-import { getDebugLog, clearDebugLog, onAny } from 'shell-ui';
+import { getDebugLog, clearDebugLog, onAny } from 'shell';
 
 // Get all captured events
 const log = getDebugLog(); // DebugLogEntry[]
@@ -702,9 +723,9 @@ const unsub = onAny((event, payload) => {
 
 ## The Documents System
 
-A VS Code-style document model for apps that manage files/documents. **Completely opt-in** — simple apps don't need it.
+A VS Code-style document model for apps that manage files/documents. **Completely opt-in**, simple apps don't need it.
 
-`Documents` is an **instantiable class** — your app creates it, owns it, passes it where needed. The shell never sees it.
+`Documents` is an **instantiable class**: your app creates it, owns it, passes it where needed. The shell never sees it.
 
 ### Core concepts
 
@@ -720,8 +741,8 @@ Create a `Documents` instance in your App component, passing an `IVirtualFileSys
 
 ```typescript
 // src/docs.ts — shared instance for your app
-import { Documents } from 'shell-ui';  // or 'rocketride/app-sdk'
-import type { IVirtualFileSystem } from 'shell-ui';
+import { Documents } from 'shell';  // or 'rocketride/app-sdk'
+import type { IVirtualFileSystem } from 'shell';
 
 let _docs: Documents | null = null;
 
@@ -798,6 +819,10 @@ All operations are methods on the `Documents` instance:
 | `closeGroup(groupId)` | Close all editors in a group |
 | `setActiveEditor(groupId, index)` | Activate an editor within a group |
 | `setActiveGroup(groupId)` | Focus a group |
+| `openStaticDocument(uri, label, content?, groupId?)` | Open a read-only static document with a display label |
+| `splitGroupWithDocument(groupId, orientation)` | Split a group, moving the active document to the new pane |
+| `updateSplitSizes(splitNodeId, sizes)` | Update the sizes of a split layout node |
+| `updateEditorViewState(editorId, viewState)` | Persist an editor's view state (e.g. scroll, cursor) |
 | `getState()` | Read state without subscribing |
 | `getDocument(uri)` | Get a single document by URI |
 | `destroy()` | Clean up the instance |
@@ -821,7 +846,7 @@ const MyComponent: React.FC = () => {
 
 ### Sharing between App and Sidebar
 
-Your `App` and `Sidebar` components are React siblings — they can't share a React context. Instead, they share the same `Documents` instance via the module-level `getDocs()` function:
+Your `App` and `Sidebar` components are React siblings, they can't share a React context. Instead, they share the same `Documents` instance via the module-level `getDocs()` function:
 
 ```
 MyApp (creates instance)     MySidebar (uses same instance)
@@ -833,7 +858,7 @@ MyApp (creates instance)     MySidebar (uses same instance)
 
 ### Content type
 
-`Document.content` is `unknown` — the exact object you store is the exact object you get back. No serialization happens inside the Documents class. The VFS handles serialization at the disk boundary.
+`Document.content` is `unknown`, the exact object you store is the exact object you get back. No serialization happens inside the Documents class. The VFS handles serialization at the disk boundary.
 
 - Pipeline editor: stores a `PipelineConfig` object
 - Text editor: stores a `string`
@@ -901,7 +926,7 @@ const vfs: IVirtualFileSystem = {
 
 ---
 
-## DocExplorer — File Tree Component
+## DocExplorer: File Tree Component
 
 A generic file tree panel (like VS Code's EXPLORER). Renders a hierarchical file tree with:
 
@@ -915,8 +940,8 @@ A generic file tree panel (like VS Code's EXPLORER). Renders a hierarchical file
 - Keyboard navigation
 
 ```typescript
-import { DocExplorer } from 'shell-ui';
-import type { DocExplorerConfig, DocEntry, IVirtualFileSystem } from 'shell-ui';
+import { DocExplorer } from 'shell';
+import type { DocExplorerConfig, DocEntry, IVirtualFileSystem } from 'shell';
 
 const config: DocExplorerConfig = {
   title: 'My Files',
@@ -951,12 +976,12 @@ const config: DocExplorerConfig = {
 
 ---
 
-## DocTabs — Tab Bar Component
+## DocTabs: Tab Bar Component
 
 A tab bar UI for a single editor group. Takes a `Documents` instance as a prop.
 
 ```typescript
-import { DocTabs } from 'shell-ui';
+import { DocTabs } from 'shell';
 import { getDocs } from './docs';
 
 <DocTabs
@@ -983,7 +1008,7 @@ Apps can expose components for other apps to use, and load components from other
 
 ### Exposing components
 
-Add them to your `components` object in the AppDescriptor. They're bundled automatically because they're imported — no extra `exposes` in rsbuild needed.
+Add them to your `components` object in the AppDescriptor. They're bundled automatically because they're imported, no extra `exposes` in rsbuild needed.
 
 ```typescript
 const MY_APP: AppDescriptor = {
@@ -1012,10 +1037,10 @@ When the shell loads your AppDescriptor, all components referenced in `component
 
 ### Loading components from another app
 
-Use `useAppComponent()` — it lazy-loads the target app's descriptor if needed and returns the component once available:
+Use `useAppComponent()`, it lazy-loads the target app's descriptor if needed and returns the component once available:
 
 ```typescript
-import { useAppComponent } from 'shell-ui';  // or 'rocketride/app-sdk'
+import { useAppComponent } from 'shell';  // or 'rocketride/app-sdk'
 
 const MyComponent: React.FC = () => {
   const Chart = useAppComponent('rocketride.otherApp', 'SpecialChart');
@@ -1028,7 +1053,7 @@ const MyComponent: React.FC = () => {
 The hook:
 - Returns `null` while the target app's descriptor is loading
 - Triggers a lazy load automatically if the app hasn't been visited yet
-- Returns the component once available — no manual loading needed
+- Returns the component once available, no manual loading needed
 
 ---
 
@@ -1075,15 +1100,15 @@ See the [Getting Started](#getting-started) section for complete `rsbuild.config
 Key points:
 - The MF container `name` is derived automatically from `appManifest.id` in `package.json`
 - Always expose `./AppDescriptor` as the single MF entry point
-- Standalone apps share `rocketride/app-sdk`; monorepo apps share `shell-ui` + `shared`
+- Standalone apps share `rocketride/app-sdk`; monorepo apps share `shell` + `rocketride`
 - React and react-dom must be shared singletons to avoid duplicate instances
 
 ---
 
 ## Reference: Complete API Surface
 
-**Monorepo apps** import from `'shell-ui'`. **Standalone apps** import from `'rocketride/app-sdk'`.
-The API surface is identical — same types, same hooks, same functions.
+**Monorepo apps** import from `'shell'`. **Standalone apps** import from `'rocketride/app-sdk'`.
+The API surface is identical: same types, same hooks, same functions.
 
 ### Types
 
@@ -1091,7 +1116,7 @@ The API surface is identical — same types, same hooks, same functions.
 
 ### Hooks
 
-`useShellConnection()`, `useShellApiConfig()`, `useWorkspace()`, `useAuthUser()`, `useLogout()`, `useSubscriptions()`, `useAppComponent()`, `useShellEvents()`, `useClickOutside()`, `useFixedPopupPosition()`
+`useShellConnection()`, `useShellApiConfig()`, `useWorkspace()`, `useAuthUser()`, `useLogout()`, `useSubscriptions()`, `useAppComponent()`, `useShellEvents()`, `useShellEvent()`, `useClient()`, `useConnectionStatus()`, `usePolling()`, `useClickOutside()`, `useFixedPopupPosition()`
 
 ### Functions
 
@@ -1099,8 +1124,8 @@ The API surface is identical — same types, same hooks, same functions.
 
 ### Classes
 
-`Documents` — instantiable document model with methods: `openDocument()`, `createDocument()`, `closeEditor()`, `updateContent()`, `saveDocument()`, `revertDocument()`, `splitGroup()`, `moveEditor()`, `closeGroup()`, `setActiveEditor()`, `setActiveGroup()`, `updateEditorViewport()`, `getState()`, `getDocument()`, `useStore()`, `destroy()`
+`Documents`: instantiable document model with methods: `openDocument()`, `createDocument()`, `closeEditor()`, `updateContent()`, `saveDocument()`, `revertDocument()`, `splitGroup()`, `moveEditor()`, `closeGroup()`, `setActiveEditor()`, `setActiveGroup()`, `updateEditorViewport()`, `getState()`, `getDocument()`, `useStore()`, `destroy()`
 
 ### Components
 
-`ShellApp`, `Shell`, `Sidebar`, `NavButton`, `BottomPanel`, `ConfirmDialog`, `DebugPanel`, `PopupRow`, `AccountPage`, `BillingPage`, `SettingsPage`, `DocExplorer`, `DocTabs`
+`Shell`, `Sidebar`, `NavButton`, `BottomPanel`, `ConfirmDialog`, `DebugPanel`, `PopupRow`, `AccountPage`, `BillingPage`, `SettingsPage`, `DocExplorer`, `DocTabs`, `DocSplitLayout`

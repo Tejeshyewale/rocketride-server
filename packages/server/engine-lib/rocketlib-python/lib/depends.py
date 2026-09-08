@@ -35,8 +35,10 @@ from __future__ import annotations
 import hashlib
 import os
 import platform
+import re
 import subprocess
 import sys
+import threading
 import time
 from glob import glob
 from typing import Optional
@@ -60,6 +62,31 @@ REQUIREMENTS_GLOBS = [
     'ai/**/requirement*.txt',
 ]
 
+# Override files: unlike constraints, uv overrides REPLACE what packages
+# declare. Discovered like requirement files; see packages/ai/src/ai/overrides.txt
+# for the policy comment. Named 'overrides.txt' so REQUIREMENTS_GLOBS
+# ('requirement*.txt') never sweeps them into the combined requirements.
+OVERRIDES_GLOBS = [
+    'overrides.txt',
+    'nodes/**/overrides.txt',
+    'ai/**/overrides.txt',
+]
+
+# Bootstrap tools install outside any constraint, so pin them or they float to 'latest' and a
+# later install downgrades them. Lockstep with packages/server/scripts/tasks.js.
+_BOOTSTRAP_TOOL_VERSIONS: dict[str, str] = {
+    'wheel': '0.47.0',
+    'setuptools': '82.0.1',
+    'uv': '0.11.25',
+}
+
+
+def _tool_spec(name: str) -> str:
+    """Pinned pip spec for a bootstrap tool; bare name if unpinned."""
+    version = _BOOTSTRAP_TOOL_VERSIONS.get(name)
+    return f'{name}=={version}' if version else name
+
+
 # Track processed requirements to avoid redundant installs in same session
 _processed: set[str] = set()
 
@@ -69,17 +96,150 @@ _processed: set[str] = set()
 # ---------------------------------------------------------------------------
 
 
+# Path to the progress sidecar file, set when the lock is acquired.
+# The lock holder writes status updates here so waiting processes can
+# display what is happening instead of a generic "Waiting..." message.
+_progress_path: Optional[str] = None
+
+# Track packages currently being downloaded so we can show a combined
+# status like "Downloading torch (2.7GiB), transformers (11.4MiB)"
+# instead of only the last line uv emitted.
+# Each entry is (name, display) where display includes the size suffix.
+_downloading: list[tuple[str, str]] = []
+
+# Last message written to the sidecar, used by the heartbeat thread
+# to refresh the timestamp so waiting processes see it ticking.
+_last_sidecar_message: Optional[str] = None
+
+# Fixed start time written to the sidecar so waiters can compute
+# total elapsed time since the install began (not since last write).
+_sidecar_start_time: float = 0.0
+
+# Heartbeat thread that re-emits monitorStatus every 5 seconds to
+# keep the task startup timeout alive during long silent operations.
+_heartbeat_thread: Optional[threading.Thread] = None
+_heartbeat_stop: Optional[threading.Event] = None
+
+
+def _write_sidecar(message: str):
+    """Write a progress update to the sidecar file (if lock is held)."""
+    global _last_sidecar_message
+    _last_sidecar_message = message
+    if _progress_path:
+        try:
+            with open(_progress_path, 'w', encoding='utf-8') as f:
+                f.write(f'{_sidecar_start_time}\n{message}\n')
+        except OSError:
+            pass
+
+
+def _start_heartbeat():
+    """Start the background heartbeat thread."""
+    global _heartbeat_thread, _heartbeat_stop, _sidecar_start_time
+    _sidecar_start_time = time.time()
+    _heartbeat_stop = threading.Event()
+
+    def _heartbeat_loop(stop_event: threading.Event):
+        """Re-emit monitorStatus every 5 seconds to reset the task startup timeout."""
+        while not stop_event.wait(5.0):
+            if _last_sidecar_message:
+                monitorStatus(_last_sidecar_message)
+
+    _heartbeat_thread = threading.Thread(target=_heartbeat_loop, args=(_heartbeat_stop,), daemon=True)
+    _heartbeat_thread.start()
+
+
+def _stop_heartbeat():
+    """Stop the background heartbeat thread."""
+    global _heartbeat_thread, _heartbeat_stop
+    if _heartbeat_stop:
+        _heartbeat_stop.set()
+    if _heartbeat_thread:
+        _heartbeat_thread.join(timeout=2.0)
+    _heartbeat_thread = None
+    _heartbeat_stop = None
+
+
+def updateProgress(message: str):
+    """
+    Send a status update to the engine monitor and write the progress sidecar.
+
+    Tracks uv "Downloading <pkg>" / "Downloaded <pkg>" lines to build a
+    combined status of all in-flight downloads, e.g. "Downloading torch,
+    transformers".  Non-download lines are passed through as-is.
+    """
+    debug(f'  [uv] {message}')
+    stripped = message.strip()
+
+    # uv emits "Downloading <name> (<size>)" when a download starts
+    if stripped.startswith('Downloading '):
+        display = stripped[len('Downloading ') :]
+        # Extract bare name for matching, e.g. "stripe (1.4MiB)" -> "stripe"
+        name = display[: display.index(' (')] if ' (' in display else display
+        if name and not any(n == name for n, _ in _downloading):
+            _downloading.append((name, display))
+        # Emit combined status with sizes, e.g. "Downloading torch (2.7GiB), stripe (1.4MiB)"
+        combined = f'Downloading {", ".join(d for _, d in _downloading)}'
+        monitorStatus(combined)
+        _write_sidecar(combined)
+        return
+
+    # uv emits "Downloaded <name>" when a download finishes
+    if stripped.startswith('Downloaded '):
+        name = stripped[len('Downloaded ') :]
+        if ' (' in name:
+            name = name[: name.index(' (')]
+        _downloading[:] = [(n, d) for n, d in _downloading if n != name]
+        # If other downloads are still in flight, show them
+        if _downloading:
+            combined = f'Downloading {", ".join(d for _, d in _downloading)}'
+            monitorStatus(combined)
+            _write_sidecar(combined)
+        else:
+            monitorStatus(message)
+            _write_sidecar(message)
+        return
+
+    # Any non-download line clears the tracking (new phase)
+    _downloading.clear()
+    monitorStatus(message)
+    _write_sidecar(message)
+
+
+def _read_progress(path: str) -> str:
+    """Read the progress sidecar written by the lock holder."""
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            lines = f.read().strip().splitlines()
+        if len(lines) < 2:
+            return ''
+        # Line 0 = unix timestamp, line 1 = status message
+        started = float(lines[0])
+        elapsed = int(time.time() - started)
+        return f'{lines[1]} ({elapsed}s)'
+    except (OSError, ValueError):
+        return ''
+
+
 class FileLock:
-    """Simple cross-platform file lock using exclusive file access."""
+    """
+    Simple cross-platform file lock using exclusive file access.
+
+    While the lock is held, callers use ``updateProgress()`` instead of
+    ``monitorStatus()`` so that a sidecar file is kept up to date for
+    waiting processes to read.
+    """
 
     def __init__(self, lock_path: str, poll_interval: float = 1.0):
         """Initialize the file lock with path and polling interval."""
         self.lock_path = lock_path
         self.poll_interval = poll_interval
         self._file = None
+        self._sidecar_path = lock_path.replace('.lock', '.progress')
 
     def __enter__(self):
         """Acquire the file lock, blocking until it is available."""
+        global _progress_path, _sidecar_start_time, _last_sidecar_message
         os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
 
         while True:
@@ -89,16 +249,31 @@ class FileLock:
                     msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
                 else:
                     fcntl.flock(self._file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                # Lock acquired — initialize sidecar state and enable writes
+                _progress_path = self._sidecar_path
+                _sidecar_start_time = time.time()
+                _last_sidecar_message = None
                 return self
             except (OSError, BlockingIOError):
                 if self._file:
                     self._file.close()
                     self._file = None
-                monitorStatus('Waiting for another installation to complete...')
+                # Read what the lock holder is doing and include it in our status
+                detail = _read_progress(self._sidecar_path)
+                if detail:
+                    monitorStatus(f'Waiting — {detail}')
+                else:
+                    monitorStatus('Waiting for another installation to complete...')
                 time.sleep(self.poll_interval)
 
     def __exit__(self, *args):
-        """Release the file lock."""
+        """Release the file lock and clean up progress sidecar."""
+        global _progress_path
+        _progress_path = None
+        try:
+            os.remove(self._sidecar_path)
+        except OSError:
+            pass
         if self._file:
             self._file.close()
             self._file = None
@@ -114,9 +289,73 @@ def _get_executable_dir() -> str:
     return os.path.dirname(os.path.abspath(sys.executable))
 
 
-def _get_cache_dir() -> str:
-    """Get the cache directory path."""
-    return os.path.join(_get_executable_dir(), 'cache')
+def engine_cache_dir(create: bool = False) -> str:
+    """Return (and create if needed) the engine cache directory (``<executable dir>/cache``).
+
+    Single source of truth for the cache location.
+
+    Args:
+        create: Create directory if indicated.
+
+    Returns:
+        Absolute path to the engine cache directory.
+    """
+    path = os.path.join(_get_executable_dir(), 'cache')
+    if create:
+        os.makedirs(path, exist_ok=True)
+    return path
+
+
+def model_cache_dir(name: str, create: bool = True) -> str:
+    """Return (and create if required) a per-model cache directory under the engine cache.
+
+    Args:
+        name: Subdirectory name for this model's weights/assets.
+        create: Create directory if indicated
+
+    Returns:
+        Absolute path to the created ``<engine cache>/models/<name>`` directory.
+    """
+    path = os.path.join(engine_cache_dir(), 'models', name)
+    if create:
+        os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _get_combined_path() -> str:
+    """Path to the concatenated requirements file (the constraints-compile input)."""
+    return os.path.join(engine_cache_dir(), 'combined.txt')
+
+
+def _get_constraints_path() -> str:
+    """Path to the compiled constraints file applied (``-c``) to every install."""
+    return os.path.join(engine_cache_dir(), 'constraints.txt')
+
+
+def _constraints_args(constraints_path: str, exe_dir: str) -> list[str]:
+    """Return uv ``-c`` args if the constraints file exists and is non-empty, else ``[]``.
+
+    Relative to exe_dir (the subprocess cwd) — uv splits the value on whitespace.
+    """
+    if os.path.exists(constraints_path) and os.path.getsize(constraints_path) > 0:
+        return ['-c', os.path.relpath(constraints_path, exe_dir)]
+    return []
+
+
+def _get_overrides_path() -> str:
+    """Path of the combined overrides file in the engine cache."""
+    return os.path.join(engine_cache_dir(), 'overrides-combined.txt')
+
+
+def _override_args(exe_dir: str) -> list[str]:
+    """Return uv ``--override`` args if the combined overrides file is non-empty, else ``[]``.
+
+    Relative to exe_dir (the subprocess cwd) — uv splits the value on whitespace.
+    """
+    overrides_path = _get_overrides_path()
+    if os.path.exists(overrides_path) and os.path.getsize(overrides_path) > 0:
+        return ['--override', os.path.relpath(overrides_path, exe_dir)]
+    return []
 
 
 def _run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
@@ -137,7 +376,15 @@ def _run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
 
     debug(f'Running: {" ".join(args)}')
 
-    proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.Popen(
+        args,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+    )
 
     # Read stdout/stderr in background threads to avoid blocking
     stdout_data = []
@@ -191,7 +438,7 @@ def _ensure_pip():
         debug('pip is available')
         return
 
-    monitorStatus('Bootstrapping pip...')
+    updateProgress('Bootstrapping pip...')
 
     # Use _run which keeps stdin open until process exits
     try:
@@ -236,9 +483,10 @@ def _ensure_wheel():
         debug('wheel is available')
         return
 
-    monitorStatus('Installing wheel...')
+    updateProgress('Installing wheel...')
     result = _run(
-        [sys.executable, '-m', 'pip', 'install', 'wheel', '--quiet', '--disable-pip-version-check'], check=False
+        [sys.executable, '-m', 'pip', 'install', _tool_spec('wheel'), '--quiet', '--disable-pip-version-check'],
+        check=False,
     )
 
     if result.returncode != 0:
@@ -272,9 +520,10 @@ def _ensure_setuptools():
         debug('setuptools is available')
         return
 
-    monitorStatus('Installing setuptools...')
+    updateProgress('Installing setuptools...')
     result = _run(
-        [sys.executable, '-m', 'pip', 'install', 'setuptools', '--quiet', '--disable-pip-version-check'], check=False
+        [sys.executable, '-m', 'pip', 'install', _tool_spec('setuptools'), '--quiet', '--disable-pip-version-check'],
+        check=False,
     )
 
     if result.returncode != 0:
@@ -294,8 +543,11 @@ def _ensure_uv():
         debug('uv is available')
         return
 
-    monitorStatus('Installing uv...')
-    result = _run([sys.executable, '-m', 'pip', 'install', 'uv', '--quiet', '--disable-pip-version-check'], check=False)
+    updateProgress('Installing uv...')
+    result = _run(
+        [sys.executable, '-m', 'pip', 'install', _tool_spec('uv'), '--quiet', '--disable-pip-version-check'],
+        check=False,
+    )
 
     if result.returncode != 0:
         error(f'Failed to install uv: {result.stderr}')
@@ -325,7 +577,7 @@ def pip(*args) -> bool:
         True if command succeeded, False otherwise
     """
     cmd = [sys.executable, '-m', 'pip'] + list(args)
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', check=False)
     return result.returncode == 0
 
 
@@ -424,6 +676,19 @@ def _find_requirement_files() -> list[str]:
     return found
 
 
+def _find_override_files() -> list[str]:
+    """Find all override files matching OVERRIDES_GLOBS."""
+    executable_dir = _get_executable_dir()
+    found = []
+    for pattern in OVERRIDES_GLOBS:
+        full_pattern = os.path.join(executable_dir, pattern)
+        for path in glob(full_pattern, recursive=True):
+            abs_path = os.path.abspath(path)
+            if os.path.isfile(abs_path) and abs_path not in found:
+                found.append(abs_path)
+    return found
+
+
 def _compute_hash(file_paths: list[str]) -> str:
     """Compute a fast hash from file metadata (mtime + size)."""
     hasher = hashlib.md5()
@@ -465,15 +730,15 @@ def _compile_constraints(constraints_path: str):
         raise RuntimeError('uv executable not found')
 
     exe_dir = _get_executable_dir()
-    monitorStatus('Compiling constraints...')
+    updateProgress('Compiling constraints...')
 
     args = [
         _uv_abs_path(),
         'pip',
         'compile',
-        './cache/combined.txt',
+        _get_combined_path(),
         '--output-file',
-        './cache/constraints.txt',
+        _get_constraints_path(),
         '--python',
         sys.executable,  # Explicitly specify Python version to avoid mismatch
         '--index-strategy',
@@ -481,6 +746,7 @@ def _compile_constraints(constraints_path: str):
         '--no-build-isolation',  # Don't create temp venvs (engine.exe can't create venvs)
         '--emit-index-url',  # Preserve --extra-index-url etc. so install/dry-run can find packages (e.g. torch+cu128)
     ]
+    args.extend(_override_args(exe_dir))
     debug(f'Compile: {args}')
     result = subprocess.run(
         args,
@@ -506,33 +772,47 @@ def ensure_constraints() -> str:
 
     Returns the path to the constraints file.
     """
-    cache_dir = _get_cache_dir()
+    cache_dir = engine_cache_dir()
     os.makedirs(cache_dir, exist_ok=True)
 
     hash_file = os.path.join(cache_dir, 'requirements.hash')
-    combined_path = os.path.join(cache_dir, 'combined.txt')
-    constraints_path = os.path.join(cache_dir, 'constraints.txt')
+    combined_path = _get_combined_path()
+    constraints_path = _get_constraints_path()
 
     # Find all requirement files
     req_files = _find_requirement_files()
+    override_files = _find_override_files()
     if not req_files:
         debug('No requirement files found')
         return constraints_path
 
     # Compute current hash
-    current_hash = _compute_hash(req_files)
+    current_hash = _compute_hash(req_files + override_files)
     stored_hash = _load_stored_hash(hash_file)
 
-    # Check if rebuild is needed
-    if current_hash == stored_hash and os.path.exists(constraints_path):
+    # Check if rebuild is needed. The derived overrides cache is part of the
+    # predicate: install-time _override_args() reads that file, so a missing
+    # one (partially cleared cache) while override files exist — or a stale
+    # non-empty one after overrides were removed — must trigger a rebuild,
+    # not be silently reused.
+    overrides_path = _get_overrides_path()
+    overrides_cache_nonempty = os.path.exists(overrides_path) and os.path.getsize(overrides_path) > 0
+    if (
+        current_hash == stored_hash
+        and os.path.exists(constraints_path)
+        and bool(override_files) == overrides_cache_nonempty
+    ):
         debug('Constraints are up to date')
         return constraints_path
 
     debug('Requirements changed, rebuilding constraints...')
-    monitorStatus('Rebuilding constraints...')
+    updateProgress('Rebuilding constraints...')
 
     # Combine all requirements
     _combine_requirements(req_files, combined_path)
+
+    # Combine all overrides (empty file list yields a zero-byte file, treated as absent)
+    _combine_requirements(override_files, _get_overrides_path())
 
     # Compile with uv
     _compile_constraints(constraints_path)
@@ -548,131 +828,191 @@ def ensure_constraints() -> str:
 # ---------------------------------------------------------------------------
 
 
-def _parse_dependency_error(output: str) -> tuple[str | None, str | None]:
+def _excludes_content() -> str:
+    """Content of uv's resolution-excludes file for this platform.
+
+    Excludes `uv` (bootstrapped by depends.py; pip-installing it crashes on Windows)
+    and, on non-Darwin, plain `onnxruntime` (it clobbers onnxruntime-gpu in the same
+    folder; the gpu build provides `import onnxruntime`).
     """
-    Parse uv/pip dependency resolution errors into user-friendly messages.
+    excludes = 'uv\n'
+    if platform.system() != 'Darwin':
+        excludes += 'onnxruntime\n'
+    return excludes
 
-    Returns (friendly_message, context) where context is additional raw info.
-    Both may be None if parsing completely failed.
+
+def _write_excludes_file() -> str:
+    """Write uv's resolution-excludes file (rewritten each call) and return its path."""
+    excludes_path = os.path.join(engine_cache_dir(), 'excludes.txt')
+    with open(excludes_path, 'w', encoding='utf-8') as f:
+        f.write(_excludes_content())
+    return excludes_path
+
+
+# ---------------------------------------------------------------------------
+# Satisfied-verdict cache
+# ---------------------------------------------------------------------------
+#
+# ``_processed`` spans one process, so every cold engine re-ran the 20-40s uv
+# resolve only to conclude that nothing was missing (#2089). Persist that
+# verdict instead, keyed by everything a resolve consults.
+#
+# Two consequences worth knowing. The fingerprint is the whole installed set,
+# so installing anything invalidates every file's verdict: on a host where
+# nodes install lazily, each install costs one extra resolve per requirements
+# file before things settle again. And the key cannot see the resolve's own
+# arguments, so _VERDICT_SCHEMA below is bumped whenever those change.
+#
+# The check and the write both run under the engine-global ``install.lock``
+# via depends(), which is what makes the non-atomic _save_hash write safe.
+# Per-node locks (#2089 ask 2) would remove that guarantee.
+
+# Bump when the resolve's inputs or semantics change (uv arguments, what the
+# key covers), so verdicts recorded under the old behaviour are not reused.
+_VERDICT_SCHEMA = '1'
+
+
+def _verdict_path(requirements_path: str) -> str:
+    """Path of the cached verdict for a requirements file."""
+    digest = hashlib.md5(os.path.abspath(requirements_path).encode('utf-8')).hexdigest()
+    return os.path.join(engine_cache_dir(), 'satisfied', f'{digest}.hash')
+
+
+def _file_digest(path: str) -> str:
+    """Content digest of a file, or empty string when it does not exist."""
+    try:
+        with open(path, 'rb') as f:
+            return hashlib.md5(f.read()).hexdigest()
+    except OSError:
+        return ''
+
+
+# A requirements line that pulls in another file: ``-r``/``--requirement`` and
+# ``-c``/``--constraint``, with the path after whitespace or ``=``.
+_INCLUDE_DIRECTIVE = re.compile(r'^\s*(?:-r|--requirement|-c|--constraint)(?:\s+|=)(?:"([^"]+)"|\'([^\']+)\'|(\S+))')
+
+
+def _requirements_closure(requirements_path: str) -> list[str]:
+    """``requirements_path`` plus every file it pulls in through ``-r`` / ``-c``, recursively.
+
+    Included paths resolve relative to the including file, as pip and uv resolve
+    them. Each file is visited once, so an include cycle terminates.
     """
-    import re
+    closure: list[str] = []
+    pending = [os.path.abspath(requirements_path)]
+    while pending:
+        path = pending.pop(0)
+        if path in closure:
+            continue
+        closure.append(path)
+        try:
+            # errors='replace' because this decode only feeds directive
+            # scanning: the digest is taken from the bytes in _file_digest, so a
+            # non-UTF-8 requirements file must not fail the node it belongs to.
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                # A trailing backslash continues the line, as in pip and uv.
+                lines = f.read().replace('\\\n', '').splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            match = _INCLUDE_DIRECTIVE.match(line)
+            if match:
+                target = match.group(1) or match.group(2) or match.group(3)
+                pending.append(os.path.normpath(os.path.join(os.path.dirname(path), target)))
+    return closure
 
-    messages = []
 
-    # --- UV-style errors ---
+def _installed_fingerprint() -> Optional[str]:
+    """Digest of the *.dist-info / *.egg-info names in site-packages, or ``None``.
 
-    # Pattern: "X==version depends on Y"
-    # Example: "accelerate==1.12.0 depends on torch==2.8.0+cu126"
-    depends_matches = re.findall(r'(\S+)==(\S+)\s+depends on\s+(\S+)', output)
+    The names carry versions, so an install, upgrade or uninstall changes it.
 
-    # Pattern: "there is no version of X"
-    no_version_matches = re.findall(r'there is no version of\s+(\S+)', output)
+    ``None`` when the directory cannot be listed. Hashing an empty list instead
+    would return the same digest every time, so the key would stop noticing
+    installs and every verdict would stay satisfied for ever — a silent stale
+    hit. Refusing the key resolves every time instead, which is the safe
+    direction. ``bootstrap()`` creates this directory before any key is
+    computed, so on the real path it always exists.
+    """
+    try:
+        entries = [e for e in os.listdir(_get_site_packages()) if e.endswith(('.dist-info', '.egg-info'))]
+    except OSError:
+        return None
+    return hashlib.md5('\n'.join(sorted(entries)).encode('utf-8')).hexdigest()
 
-    # Pattern: "X cannot be used"
-    cannot_use = re.search(r'we can conclude that\s+(\S+)==(\S+)\s+cannot be used', output)
 
-    # Pattern: "requirements are unsatisfiable"
-    unsatisfiable = 'requirements are unsatisfiable' in output.lower()
+def _verdict_key(requirements_path: str, constraints_path: str) -> Optional[str]:
+    """Key under which a "satisfied" verdict for ``requirements_path`` is valid.
 
-    # --- Pip-style errors ---
+    Everything that can change what a resolve concludes is part of it,
+    including every file the requirements file includes through ``-r`` / ``-c``.
 
-    # Pattern: "No matching distribution found for X"
-    no_dist = re.search(r'No matching distribution found for\s+(\S+)', output, re.IGNORECASE)
+    Returns ``None`` when the key cannot be computed honestly — a directive
+    names something that is not a readable file, or site-packages cannot be
+    listed. In
+    both cases something the resolve depends on is invisible here, so the key
+    would be stable over changing inputs. Refusing it degrades to resolving
+    every time, which is the safe direction — a stable key over an unseen
+    input keeps reporting "satisfied" after that input gains a dependency.
+    """
+    closure = _requirements_closure(requirements_path)
+    if not all(os.path.isfile(path) for path in closure):
+        return None
 
-    # Pattern: "Could not find a version that satisfies the requirement X"
-    no_satisfy = re.search(r'Could not find a version that satisfies the requirement\s+(\S+)', output, re.IGNORECASE)
+    installed = _installed_fingerprint()
+    if installed is None:
+        return None
 
-    # Pattern: "X requires Python >=Y"
-    python_req = re.search(r'(\S+)\s+requires\s+[Pp]ython\s*([<>=!]+\s*[\d.]+)', output)
+    parts = [_VERDICT_SCHEMA, sys.executable, sys.version]
+    parts.extend(_file_digest(path) for path in closure)
+    parts.extend(
+        [
+            _file_digest(constraints_path),
+            _file_digest(_get_overrides_path()),
+            _excludes_content(),
+            installed,
+        ]
+    )
+    # NUL-separated: none of the parts can contain it, so field boundaries
+    # stay unambiguous even though two of them are multi-line text.
+    return hashlib.md5('\0'.join(parts).encode('utf-8')).hexdigest()
 
-    # Pattern: "package X has requirement Y, but you have Z"
-    has_req = re.search(r'(\S+)\s+has requirement\s+(\S+),?\s+but you have\s+(\S+)', output, re.IGNORECASE)
 
-    # Pattern: "X is not available for" (platform issues)
-    not_available = re.search(r'(\S+)\s+is not available for', output, re.IGNORECASE)
+def _verdict_cached(requirements_path: str, constraints_path: str) -> bool:
+    """True when a previous resolve recorded this requirements file as satisfied under the current key.
 
-    # Pattern: version conflict "X and Y are incompatible"
-    incompatible = re.search(r'(\S+)\s+and\s+(\S+)\s+are incompatible', output, re.IGNORECASE)
+    An unreadable cache, or a key the closure refuses to produce, is a miss —
+    never an error. The cache is an optimisation: anything it cannot answer
+    must fall back to resolving, not fail the node that asked.
+    """
+    try:
+        stored = _load_stored_hash(_verdict_path(requirements_path))
+        if stored is None:
+            return False
+        key = _verdict_key(requirements_path, constraints_path)
+        return key is not None and stored == key
+    except Exception as e:  # noqa: BLE001 - a cache read must never fail an install
+        debug(f'  Could not read the satisfied verdict ({e}); resolving instead')
+        return False
 
-    # Pattern: "Conflicting dependencies"
-    conflicting = re.search(r'[Cc]onflicting dependencies', output)
 
-    # --- Build the message ---
+def _save_verdict(requirements_path: str, constraints_path: str):
+    """Record that ``requirements_path`` is satisfied under the current key.
 
-    # UV: depends + no_version = clear cause
-    if depends_matches and no_version_matches:
-        for req_pkg, req_ver, dep in depends_matches:
-            for missing in no_version_matches:
-                if missing in dep or dep in missing:
-                    messages.append(f"'{req_pkg}=={req_ver}' requires '{missing}' which is not available")
-        if not messages:
-            # Fallback: just report what we found
-            req_pkg, req_ver, dep = depends_matches[0]
-            missing = no_version_matches[0]
-            messages.append(f"'{req_pkg}=={req_ver}' requires '{dep}', but '{missing}' is not available")
-
-    # UV: cannot be used
-    if cannot_use:
-        pkg_name = cannot_use.group(1)
-        pkg_version = cannot_use.group(2)
-        messages.append(f"'{pkg_name}=={pkg_version}' cannot be used due to dependency conflicts")
-
-    # Pip: no matching distribution
-    if no_dist:
-        messages.append(f"No matching distribution found for '{no_dist.group(1)}'")
-
-    # Pip: no version satisfies
-    if no_satisfy:
-        messages.append(f"No version satisfies requirement '{no_satisfy.group(1)}'")
-
-    # Python version requirement
-    if python_req:
-        messages.append(f"'{python_req.group(1)}' requires Python {python_req.group(2)}")
-
-    # Has requirement conflict
-    if has_req:
-        messages.append(f"'{has_req.group(1)}' requires '{has_req.group(2)}' but '{has_req.group(3)}' is installed")
-
-    # Platform not available
-    if not_available:
-        messages.append(f"'{not_available.group(1)}' is not available for this platform")
-
-    # Incompatible packages
-    if incompatible:
-        messages.append(f"'{incompatible.group(1)}' and '{incompatible.group(2)}' are incompatible")
-
-    # Generic conflicting
-    if conflicting and not messages:
-        messages.append('Conflicting dependencies detected')
-
-    # Unsatisfiable as last resort
-    if unsatisfiable and not messages:
-        messages.append('Requirements are unsatisfiable')
-
-    # --- Format output ---
-
-    if not messages:
-        return None, None
-
-    # Combine messages
-    friendly = '. '.join(messages) + '.'
-
-    # Add actionable advice
-    if depends_matches:
-        pkg = depends_matches[0][0]
-        friendly += f" Consider removing or updating '{pkg}' in requirements.txt."
-
-    # Extract context: first few lines of actual error
-    context_lines = []
-    for line in output.splitlines():
-        line = line.strip()
-        if line and not line.startswith('hint:') and len(line) < 200:
-            context_lines.append(line)
-            if len(context_lines) >= 3:
-                break
-    context = ' | '.join(context_lines) if context_lines else None
-
-    return friendly, context
+    Best effort, like the progress sidecar: the verdict only saves the next
+    process a resolve, so a cache that cannot be written must not fail an
+    install that succeeded.
+    """
+    try:
+        key = _verdict_key(requirements_path, constraints_path)
+        if key is None:
+            debug(f'  Not recording a verdict: an include of {requirements_path} does not resolve')
+            return
+        verdict_file = _verdict_path(requirements_path)
+        os.makedirs(os.path.dirname(verdict_file), exist_ok=True)
+        _save_hash(verdict_file, key)
+    except Exception as e:  # noqa: BLE001 - a cache write must never fail an install
+        debug(f'  Could not record the satisfied verdict ({e}); the next process will resolve again')
 
 
 def _install_dry_run(requirements_path: str, constraints_path: str) -> list[str]:
@@ -696,43 +1036,44 @@ def _install_dry_run(requirements_path: str, constraints_path: str) -> list[str]
         requirements_path,
         '--index-strategy',
         'unsafe-best-match',
-        '--no-build-isolation',  # Don't create temp venvs (engine.exe can't create venvs)
+        '--no-build-isolation',
         '--dry-run',
         '--no-color',
     ]
 
-    # Only add constraints if the file exists and has content
-    if os.path.exists(constraints_path) and os.path.getsize(constraints_path) > 0:
-        args.extend(['-c', './cache/constraints.txt'])
+    # uv splits --excludes on whitespace, so an absolute path with a space (macOS
+    # "Application Support") breaks resolution; pass it relative to the cwd (exe_dir).
+    # See #1256.
+    args.extend(['--excludes', os.path.relpath(_write_excludes_file(), exe_dir)])
+
+    args.extend(_constraints_args(constraints_path, exe_dir))
+    args.extend(_override_args(exe_dir))
 
     debug(f'Dry-run: {args}')
-    result = subprocess.run(args, capture_output=True, text=True, check=False, stdin=subprocess.PIPE, cwd=exe_dir)
+    result = subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+        check=False,
+        stdin=subprocess.PIPE,
+        cwd=exe_dir,
+    )
 
-    # Check if dry-run failed (e.g., dependency resolution error)
     if result.returncode != 0:
         output = (result.stderr + result.stdout).strip()
+        debug(f'Dry-run failed (rc={result.returncode}): {output[:500]}')
+        error(f'Dependency resolution failed for {requirements_path}: {output}')
+        raise RuntimeError(f'Dependency resolution failed: {output[:200]}')
 
-        # Try to parse a user-friendly error message
-        friendly_msg, context = _parse_dependency_error(output)
-        if friendly_msg:
-            debug(f'Dependency error: {friendly_msg}')
-            if context:
-                debug(f'  Context: {context}')
-            error(f'Dependency error in {requirements_path}: {friendly_msg}')
-            raise RuntimeError(f'Dependency error: {friendly_msg}')
-        else:
-            # Couldn't parse - show raw output
-            debug(f'Dry-run failed (rc={result.returncode}): {output[:500]}')
-            error(f'Dependency resolution failed for {requirements_path}: {output}')
-            raise RuntimeError(f'Dependency resolution failed: {output[:200]}')
-
-    # Parse packages from output - lines starting with "+ "
+    # Parse packages from output — lines starting with "+ "
     packages = []
     for line in (result.stderr + result.stdout).splitlines():
         line = line.strip()
         if line.startswith('+ '):
             # Line format: "+ package==version" or "+ package[extra]==version"
-            pkg = line[2:].strip()  # Remove "+ "
+            pkg = line[2:].strip()
             if '==' in pkg:
                 pkg = pkg.split('==')[0]
             if '[' in pkg:
@@ -743,10 +1084,41 @@ def _install_dry_run(requirements_path: str, constraints_path: str) -> list[str]
 
 
 def _install_requirements(requirements_path: str, constraints_path: str):
-    """Install requirements using uv with constraints. Only installs if needed."""
-    import importlib
+    """
+    Install requirements using uv with constraints.
 
+    Runs a dry-run first to check if anything needs installing. If all
+    requirements are satisfied, skips the install entirely. Otherwise,
+    streams download and install progress through updateProgress().
+    """
     debug(f'Installing requirements from: {requirements_path}')
+
+    # Skip empty requirements files (comments/blanks only) to avoid uv warnings
+    with open(requirements_path, 'r', encoding='utf-8') as f:
+        has_deps = any(line.strip() and not line.strip().startswith('#') for line in f)
+    if not has_deps:
+        debug(f'  Empty requirements file, skipping: {requirements_path}')
+        return
+
+    # A previous process already resolved this file against this environment
+    # and found it satisfied: nothing to install, and nothing to resolve.
+    if _verdict_cached(requirements_path, constraints_path):
+        debug(f'  Satisfied verdict cached, skipping resolve: {requirements_path}')
+        return
+
+    # Start heartbeat early — the dry-run can block on uv's internal lock
+    # for minutes, and we need monitorStatus events to keep the task startup
+    # timeout alive during that time.
+    _start_heartbeat()
+    try:
+        return _install_requirements_inner(requirements_path, constraints_path)
+    finally:
+        _stop_heartbeat()
+
+
+def _install_requirements_inner(requirements_path: str, constraints_path: str):
+    """Inner install logic, runs under the heartbeat thread."""
+    import importlib
 
     # Check what needs to be installed (raises on failure)
     packages = _install_dry_run(requirements_path, constraints_path)
@@ -755,6 +1127,7 @@ def _install_requirements(requirements_path: str, constraints_path: str):
     # If dry-run returned empty list, all packages are satisfied
     if len(packages) == 0:
         debug(f'All requirements satisfied: {requirements_path}')
+        _save_verdict(requirements_path, constraints_path)
         return
 
     # Format status message: show up to 5 packages, or 4 + "..." if more than 5
@@ -762,9 +1135,7 @@ def _install_requirements(requirements_path: str, constraints_path: str):
         pkg_list = ', '.join(packages)
     else:
         pkg_list = ', '.join(packages[:4]) + ', ...'
-    monitorStatus(f'Installing {pkg_list}')
-    debug(f'sys.executable: {sys.executable}')
-    debug(f'cwd: {os.getcwd()}')
+    updateProgress(f'Installing {pkg_list}')
 
     # Build uv command
     exe_dir = _get_executable_dir()
@@ -780,10 +1151,14 @@ def _install_requirements(requirements_path: str, constraints_path: str):
         'unsafe-best-match',
         '--no-build-isolation',  # Don't create temp venvs (engine.exe can't create venvs)
     ]
-    if os.path.exists(constraints_path) and os.path.getsize(constraints_path) > 0:
-        uv_args.extend(['-c', './cache/constraints.txt'])
 
-    # Run uv and stream output
+    # Relative to cwd (exe_dir) — see the --excludes note in _install_dry_run (#1256).
+    uv_args.extend(['--excludes', os.path.relpath(_write_excludes_file(), exe_dir)])
+
+    uv_args.extend(_constraints_args(constraints_path, exe_dir))
+    uv_args.extend(_override_args(exe_dir))
+
+    # Run uv and stream output (heartbeat is already running from the caller)
     debug(f'Install: {uv_args}')
     proc = subprocess.Popen(
         uv_args,
@@ -791,13 +1166,15 @@ def _install_requirements(requirements_path: str, constraints_path: str):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding='utf-8',
+        errors='replace',
         bufsize=1,
     )
     output_lines = []
     for line in proc.stdout:
         line = line.rstrip()
         output_lines.append(line)
-        monitorStatus(line)
+        updateProgress(line)
     proc.wait()
 
     if proc.returncode != 0:
@@ -813,6 +1190,9 @@ def _install_requirements(requirements_path: str, constraints_path: str):
 
     # Clear path importer cache for site-packages to force re-scan
     sys.path_importer_cache.pop(_get_site_packages(), None)
+
+    # The install changed the installed set: record the verdict against it.
+    _save_verdict(requirements_path, constraints_path)
 
     debug(f'Installed: {requirements_path}')
 
@@ -848,7 +1228,7 @@ def depends(requirements: Optional[str] = None):
             debug('  Already processed, skipping')
             return
 
-    cache_dir = _get_cache_dir()
+    cache_dir = engine_cache_dir()
     lock_path = os.path.join(cache_dir, 'install.lock')
 
     with FileLock(lock_path):
@@ -870,6 +1250,23 @@ def depends(requirements: Optional[str] = None):
         _apply_pywin32_hack()
 
 
+def load_depends(current_file: str, requirements_file: str = 'requirements.txt') -> None:
+    """Install a requirements file located alongside the calling module.
+
+    Saves callers the os.path boilerplate of resolving a requirements file next
+    to their own module. Equivalent to ``depends(<dir of current_file>/<requirements_file>)``.
+
+    Args:
+        current_file: The caller's ``__file__``.
+        requirements_file: Requirements filename in that module's directory (default 'requirements.txt').
+
+    Returns:
+        None.
+    """
+    requirements = os.path.join(os.path.dirname(os.path.realpath(current_file)), requirements_file)
+    depends(requirements)
+
+
 # ---------------------------------------------------------------------------
 # Main Mode
 # ---------------------------------------------------------------------------
@@ -885,7 +1282,7 @@ def main():
     through to 'uv pip'. Falls back to standard pip if uv can't build
     source distributions due to virtualenv creation issues.
     """
-    cache_dir = _get_cache_dir()
+    cache_dir = engine_cache_dir()
     lock_path = os.path.join(cache_dir, 'install.lock')
 
     with FileLock(lock_path):
@@ -911,10 +1308,8 @@ def main():
                 uv_args += ['--index-strategy', 'unsafe-best-match']
 
             # For install/sync commands, add constraints file if available
-            constraints_path = os.path.join(cache_dir, 'constraints.txt')
             if sys.argv[1] in ('install', 'sync'):
-                if os.path.exists(constraints_path) and os.path.getsize(constraints_path) > 0:
-                    uv_args.extend(['-c', './cache/constraints.txt'])
+                uv_args.extend(_constraints_args(_get_constraints_path(), exe_dir))
 
             # Run uv
             result = subprocess.run(uv_args, cwd=exe_dir)

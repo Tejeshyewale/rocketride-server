@@ -27,10 +27,10 @@
 tool_pipe node instance.
 
 Exposes a configurable tool to agents. When invoked, routes the input to all
-connected output lanes. The write call is synchronous — by the time it returns,
-all the downstream response nodes have already populated currentObject.response.
-The new response entries are snapshotted and then removed so they don't leak
-into the parent pipeline.
+connected output lanes, then flushes (closing) and closes the sub-pipeline in
+dependency order so buffer-and-flush nodes (e.g. a join) emit their accumulated
+output into currentObject.response before it is read. The new response entries
+are snapshotted and then removed so they don't leak into the parent pipeline.
 """
 
 from __future__ import annotations
@@ -39,6 +39,8 @@ import json
 
 from rocketlib import IInstanceBase, getObject, tool_function, debug
 from rocketlib import IJson
+
+from ai.common.utils import normalize_tool_input
 
 from .IGlobal import IGlobal
 
@@ -83,7 +85,7 @@ class IInstance(IInstanceBase):
     )
     def run_pipe(self, input_obj) -> dict:
         """Run the connected pipeline with the given input and return its result."""
-        args = _normalize_tool_input(input_obj)
+        args = normalize_tool_input(input_obj)
         data = args.get('data')
         if not data:
             raise ValueError('tool_pipe: tool requires a non-empty `data` parameter')
@@ -101,7 +103,10 @@ class IInstance(IInstanceBase):
             raise
         finally:
             if opened:
-                self.instance.close()
+                try:
+                    self.instance.closing()
+                finally:
+                    self.instance.close()
 
         response = _to_python_dict(entry.response)
 
@@ -178,28 +183,3 @@ def _extract_return_value(result: dict, return_type: str) -> str:
         return json.dumps(value, ensure_ascii=False)
 
     return str(value) if value is not None else ''
-
-
-def _normalize_tool_input(input_obj):
-    """Normalise tool input into a plain dict."""
-    if input_obj is None:
-        return {}
-    if hasattr(input_obj, 'model_dump') and callable(getattr(input_obj, 'model_dump')):
-        input_obj = input_obj.model_dump()
-    elif hasattr(input_obj, 'dict') and callable(getattr(input_obj, 'dict')):
-        input_obj = input_obj.dict()
-    if isinstance(input_obj, str):
-        try:
-            parsed = json.loads(input_obj)
-            if isinstance(parsed, dict):
-                input_obj = parsed
-        except Exception:
-            pass
-    if not isinstance(input_obj, dict):
-        return {}
-    if 'input' in input_obj and isinstance(input_obj['input'], dict):
-        inner = input_obj['input']
-        extras = {k: v for k, v in input_obj.items() if k != 'input'}
-        input_obj = {**inner, **extras}
-    input_obj.pop('security_context', None)
-    return input_obj

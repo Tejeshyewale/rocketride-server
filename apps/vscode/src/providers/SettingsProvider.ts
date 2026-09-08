@@ -39,6 +39,8 @@ import { getConnectionManager, getEngineRegistry } from '../extension';
 import { AgentManager } from '../agents/agent-manager';
 import { DeployManager } from '../connection/deploy-manager';
 import { ConnectionMessageHandler } from './shared/connection-message-handler';
+import { isSubscribed } from '../shared/util/subscriptionGate';
+import { PIPE_BUILDER_APP_ID } from '../shared/types';
 
 export class SettingsProvider {
 	private disposables: vscode.Disposable[] = [];
@@ -69,8 +71,8 @@ export class SettingsProvider {
 	 */
 	private registerCommands(): void {
 		const commands = [
-			vscode.commands.registerCommand('rocketride.page.settings.open', async (focus?: string) => {
-				await this.openSettings(focus);
+			vscode.commands.registerCommand('rocketride.page.settings.open', async (focus?: string, authError?: string) => {
+				await this.openSettings(focus, authError);
 			}),
 
 			vscode.commands.registerCommand('rocketride.page.settings.setupCredentials', async () => {
@@ -103,18 +105,25 @@ export class SettingsProvider {
 	 */
 	/** Pending focus section — sent to webview after view:ready. */
 	private pendingFocus?: string;
+	/** Pending auth error — shown as a banner when the page opens due to auth failure. */
+	private pendingAuthError?: string;
 
 	/**
 	 * Opens the settings page, optionally focused on a single section.
 	 * @param focus - If set ('development' or 'deployment'), shows only that section.
+	 * @param authError - If set, displays an auth-failure banner that clears on successful test.
 	 */
-	public async openSettings(focus?: string): Promise<void> {
+	public async openSettings(focus?: string, authError?: string): Promise<void> {
 		this.pendingFocus = focus;
+		this.pendingAuthError = authError;
 		if (this.panel) {
 			this.panel.reveal(vscode.ViewColumn.One);
 			// Panel already open — send focus update directly
 			if (focus) {
 				this.panel.webview.postMessage({ type: 'setFocus', focus });
+			}
+			if (authError) {
+				this.panel.webview.postMessage({ type: 'authError', message: authError });
 			}
 			return;
 		}
@@ -142,6 +151,10 @@ export class SettingsProvider {
 							panel.webview.postMessage({ type: 'setFocus', focus: this.pendingFocus });
 							this.pendingFocus = undefined;
 						}
+						if (this.pendingAuthError) {
+							panel.webview.postMessage({ type: 'authError', message: this.pendingAuthError });
+							this.pendingAuthError = undefined;
+						}
 						await this.connHandler.startStatusPolling();
 						break;
 
@@ -152,6 +165,53 @@ export class SettingsProvider {
 					case 'clearCredentials':
 						await this.clearCredentials(panel.webview);
 						break;
+
+					// -- Checkout flow (embedded Stripe Elements) --------------------
+					case 'checkout:fetchPlans': {
+						try {
+							const billingClient = getConnectionManager()?.getClient();
+							if (!billingClient) throw new Error('Not connected');
+							const plans = await billingClient.billing.getProductPrices(PIPE_BUILDER_APP_ID);
+							panel.webview.postMessage({ type: 'checkout:plansResult', plans, error: null });
+						} catch (err: unknown) {
+							const msg = err instanceof Error ? err.message : String(err);
+							panel.webview.postMessage({ type: 'checkout:plansResult', plans: [], error: msg });
+						}
+						break;
+					}
+
+					case 'checkout:createSession': {
+						try {
+							const billingClient = getConnectionManager()?.getClient();
+							if (!billingClient) throw new Error('Not connected');
+							const orgId = billingClient.getAccountInfo()?.organization?.id;
+							if (!orgId) throw new Error('No organisation found');
+							const result = await billingClient.billing.createCheckoutSession(orgId, PIPE_BUILDER_APP_ID, message.priceId as string);
+							panel.webview.postMessage({ type: 'checkout:sessionResult', ...result, error: null });
+						} catch (err: unknown) {
+							const msg = err instanceof Error ? err.message : String(err);
+							panel.webview.postMessage({ type: 'checkout:sessionResult', clientSecret: '', subscriptionId: '', error: msg });
+						}
+						break;
+					}
+
+					case 'checkout:confirmPending': {
+						try {
+							const billingClient = getConnectionManager()?.getClient();
+							if (!billingClient) throw new Error('Not connected');
+							await (billingClient as any).dapRequest('rrext_account_billing', {
+								subcommand: 'confirm_pending',
+								appId: PIPE_BUILDER_APP_ID,
+								subscriptionId: message.subscriptionId,
+								priceId: message.priceId,
+							});
+							panel.webview.postMessage({ type: 'checkout:confirmResult', error: null });
+						} catch (err: unknown) {
+							const msg = err instanceof Error ? err.message : String(err);
+							panel.webview.postMessage({ type: 'checkout:confirmResult', error: msg });
+						}
+						break;
+					}
 
 					default: {
 						// Delegate connection messages (cloud, docker, service, test, engine versions, sudo)
@@ -220,11 +280,8 @@ export class SettingsProvider {
 				hostUrl: config.development.hostUrl,
 				hasApiKey: hasApiKey,
 				apiKey: apiKey,
-				teamId: config.development.teamId,
 				local: {
 					engineVersion: config.development.local.engineVersion,
-					debugOutput: config.development.local.debugOutput,
-					engineArgs: config.development.local.engineArgs,
 				},
 			},
 			deployment: {
@@ -232,17 +289,18 @@ export class SettingsProvider {
 				hostUrl: config.deployment.hostUrl,
 				hasApiKey: !!config.deployment.apiKey,
 				apiKey: config.deployment.apiKey || '',
-				teamId: config.deployment.teamId,
 				local: {
 					engineVersion: config.deployment.local.engineVersion,
-					debugOutput: config.deployment.local.debugOutput,
-					engineArgs: config.deployment.local.engineArgs,
 				},
 			},
 
 			// Top-level settings
 			defaultPipelinePath: config.defaultPipelinePath,
 			pipelineRestartBehavior: config.pipelineRestartBehavior,
+			pipelineTtl: config.pipelineTtl,
+			pipelineTraceLevel: config.pipelineTraceLevel,
+			taskArguments: config.taskArguments,
+			pipelineDebugOutput: config.pipelineDebugOutput,
 
 			// Integration settings
 			autoAgentIntegration: workspaceConfig.get('integrations.autoAgentIntegration', true),
@@ -254,12 +312,14 @@ export class SettingsProvider {
 			integrationAgentsMd: workspaceConfig.get('integrations.agentsMd', false),
 		};
 
+		// Include subscription status with settings so it's always in sync
+		const cm = getConnectionManager();
+		const client = cm?.getClient();
 		webview.postMessage({
 			type: 'settingsLoaded',
 			settings: allSettings,
+			isSubscribed: isSubscribed(client, PIPE_BUILDER_APP_ID),
 		});
-
-		// Teams are fetched by CloudPanel after it confirms the server is SaaS
 	}
 
 	/**
@@ -277,16 +337,6 @@ export class SettingsProvider {
 		try {
 			// Cast to the typed snapshot (webview sends the full SettingsData shape)
 			const snapshot = settings as unknown as SettingsSnapshot;
-
-			// Validate: cloud mode requires a team selection
-			if (snapshot.development.connectionMode === 'cloud' && !snapshot.development.teamId) {
-				this.showMessage(webview, 'error', 'Please select a team for the development cloud connection.');
-				return;
-			}
-			if (snapshot.deployment.connectionMode === 'cloud' && !snapshot.deployment.teamId) {
-				this.showMessage(webview, 'error', 'Please select a team for the deployment cloud connection.');
-				return;
-			}
 
 			// Step 1: Write everything atomically — ConfigManager suppresses all
 			// intermediate config-change listeners during the batch so no CM reacts
@@ -340,9 +390,7 @@ export class SettingsProvider {
 
 			// Verify it was actually cleared
 			const hasApiKey = this.configManager.hasApiKey();
-			if (!hasApiKey) {
-				this.showMessage(webview, 'success', 'API Key cleared successfully and removed from secure storage');
-			} else {
+			if (hasApiKey) {
 				this.showMessage(webview, 'error', 'API Key may not have been fully cleared - please try again');
 			}
 

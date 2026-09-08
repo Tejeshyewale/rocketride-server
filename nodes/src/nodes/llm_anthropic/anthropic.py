@@ -23,59 +23,23 @@
 
 """
 Anthropic binding for the ChatLLM.
+
+Extended-thinking streaming is handled globally via
+``ai.common.llm_native_stream`` (``_native_stream_provider = 'anthropic'``).
 """
 
 from typing import Any, Dict
+
 from ai.common.chat import ChatBase
 from ai.common.config import Config
+from ai.common.llm_native_stream import build_anthropic_thinking_kwargs, gate_model_name
+from ai.common.utils import parse_bool
 from langchain_anthropic import ChatAnthropic
 
-# --- ANTI-SIGBUS PATCH: disable fast tokenizers and Claude-specific token counting ---
-# 1) Disable tokenizer parallelism
-import os
 
-os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
-
-# 2) Force AutoTokenizer to use the slow (Python) version to avoid Rust binary crashes
-try:
-    import transformers as _tf  # type: ignore
-
-    _orig_from_pretrained = _tf.AutoTokenizer.from_pretrained
-
-    def _patched_from_pretrained(*args, **kwargs):
-        kwargs.setdefault('use_fast', False)
-        return _orig_from_pretrained(*args, **kwargs)
-
-    _tf.AutoTokenizer.from_pretrained = _patched_from_pretrained
-except Exception:
-    # If transformers is not installed or fails, just skip
-    pass
-
-# 3) Disable real token counting ONLY for Claude models to avoid transformer usage
-try:
-    import langchain_core.utils.tokenization as _tok  # type: ignore
-
-    _orig_get_token_ids = _tok.get_token_ids
-
-    def _patched_get_token_ids(*args, **kwargs):
-        # Compatible with both positional and keyword arguments
-        text = kwargs.get('text', args[0] if args else '')
-        model_name = kwargs.get('model_name')
-        if model_name is None and len(args) >= 2:
-            model_name = args[1]
-
-        if model_name and 'claude' in str(model_name).lower():
-            # Simple estimate: ~4 chars/token; LC only needs len(ids)
-            n = max(1, (len(text) + 3) // 4)
-            return [0] * n
-
-        return _orig_get_token_ids(*args, **kwargs)
-
-    _tok.get_token_ids = _patched_get_token_ids
-except Exception:
-    # If LC is not imported yet, step 2 already avoids crashes
-    pass
-# --- END PATCH ---
+def _estimate_token_ids(text: str) -> list:
+    """Estimate token ids at ~4 chars/token."""
+    return [0] * max(1, (len(text) + 3) // 4)
 
 
 class Chat(ChatBase):
@@ -94,6 +58,7 @@ class Chat(ChatBase):
 
         # Get the model
         model = config.get('model')
+        model_gate = gate_model_name(str(model) if model is not None else '')
 
         # Get the API key, don't save it
         apikey = (config.get('apikey') or '').strip()
@@ -106,8 +71,23 @@ class Chat(ChatBase):
         # Init the chat base
         super().__init__(provider, connConfig, bag)
 
-        # Get the LLM
-        self._llm = ChatAnthropic(model=model, api_key=apikey, temperature=0, max_tokens=self._modelOutputTokens)
+        # Extended thinking is opt-in per node (config extendedThinking, default off) and only
+        # for reasoning models. It is NOT baked into the client: the native streaming adapter adds
+        # it per call, so thinking activates on the interactive streaming path only — never on the
+        # agent / expectJson path (which has no streaming and stays on the plain LangChain client).
+        self._thinking_mode_kwargs: Dict[str, Any] = {}
+        if self._is_reasoning and parse_bool(config.get('extendedThinking')):
+            self._thinking_mode_kwargs = build_anthropic_thinking_kwargs(model_gate, self._modelOutputTokens)
+        self._extended_thinking = bool(self._thinking_mode_kwargs)
+        if self._extended_thinking:
+            self._native_stream_provider = 'anthropic'
+
+        self._llm = ChatAnthropic(
+            model=model,
+            api_key=apikey,
+            max_tokens=self._modelOutputTokens,
+            custom_get_token_ids=_estimate_token_ids,
+        )
 
         # Save our chat class into the bag
         bag['chat'] = self

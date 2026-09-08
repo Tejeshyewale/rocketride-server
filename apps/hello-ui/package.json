@@ -1,6 +1,6 @@
 {
   "name": "@rocketride/hello-ui",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "description": "RocketRide Hello — OSS landing page and dashboard",
   "license": "MIT",
@@ -10,14 +10,19 @@
     "name": "RocketRide",
     "description": "Landing page and dashboard",
     "icon": "./src/icon.svg",
-    "categories": ["built-in"],
+    "categories": [
+      "built-in"
+    ],
     "mode": "free",
     "authenticated": false,
-    "showStatusBar": true
+    "showStatusBar": true,
+    "shells": [
+      "oss"
+    ]
   },
   "scripts": {
-    "build": "pnpm rsbuild build",
-    "build:prod": "pnpm rsbuild build --env-mode production"
+    "build": "rsbuild build",
+    "build:prod": "rsbuild build --env-mode production"
   },
   "browserslist": [
     "chrome >= 81",
@@ -26,16 +31,17 @@
     "safari >= 13"
   ],
   "dependencies": {
-    "@module-federation/rsbuild-plugin": "^0.9.0",
-    "shell-ui": "workspace:*",
-    "shared": "workspace:*",
+    "@module-federation/rsbuild-plugin": "^2.5.1",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "shared": "workspace:*"
+    "rocketride": "workspace:*",
+    "shell": "file:../../.rocketride/shell/shell.tgz"
   },
   "devDependencies": {
-    "@rsbuild/core": "~1.7.5",
-    "@rsbuild/plugin-react": "~1.4.6",
-    "typescript": "^5.3.0"
+    "@rsbuild/core": "~2.0.11",
+    "@rsbuild/plugin-react": "~2.0.1",
+    "typescript": "^5.3.0",
+    "@types/react": "~18.3.31",
+    "@types/react-dom": "~18.3.7"
   }
 }

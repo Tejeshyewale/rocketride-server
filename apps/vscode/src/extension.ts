@@ -36,6 +36,7 @@ import { icons } from './shared/util/icons';
 import { ConnectionManager } from './connection/connection';
 import { DeployManager } from './connection/deploy-manager';
 import { ConfigManager } from './config';
+import { savePipelineDocument } from './shared/util/pipelineSave';
 import { EngineRegistry } from './engine';
 import { getUserConfigDir, getSystemInstallDir, migrateLocalEngine, migrateServiceConfig } from './engine/config/config-migration';
 
@@ -49,11 +50,18 @@ import { BarStatus } from './providers/BarStatusProvider';
 import { WelcomeProvider } from './providers/WelcomeProvider';
 import { AccountProvider } from './providers/AccountProvider';
 import { EnvironmentProvider } from './providers/EnvironmentProvider';
+import { NewAppProvider } from './providers/NewAppProvider';
 // BillingProvider removed — billing is now a tab in AccountProvider
-import { AuthProvider } from './providers/AuthProvider';
+// AuthProvider removed — auth failures now open the Settings page directly
 import { AgentManager } from './agents/agent-manager';
 import { syncServiceCatalog } from './agents/services';
 import { CloudAuthProvider } from './auth/CloudAuthProvider';
+import { AppScreenProvider } from './providers/AppScreenProvider';
+import { initWatchManager } from './appdev/watchManager';
+import { debugApp } from './appdev/debug';
+
+// Extension context — set once in activate(), available via getExtensionContext()
+let extensionContext: vscode.ExtensionContext;
 
 // Core managers
 let connectionManager: ConnectionManager | undefined;
@@ -67,6 +75,7 @@ let settings: SettingsProvider | undefined;
 let _monitor: MonitorProvider | undefined;
 // deploy removed — functionality moved to Settings panels
 let status: StatusProvider | undefined;
+let appScreen: AppScreenProvider | undefined;
 let barStatus: BarStatus | undefined;
 let welcome: WelcomeProvider | undefined;
 
@@ -77,18 +86,6 @@ let welcome: WelcomeProvider | undefined;
 async function runMigrations(context: vscode.ExtensionContext): Promise<void> {
 	const logger = getLogger();
 	const config = vscode.workspace.getConfiguration('rocketride');
-
-	// Migration 1: engineArgs array → string (v1.0.0 → v1.0.2)
-	const engineArgs = config.inspect<unknown>('engineArgs');
-	const migrateArgs = async (scope: vscode.ConfigurationTarget, value: unknown) => {
-		if (Array.isArray(value)) {
-			const joined = (value as string[]).join(' ');
-			await config.update('engineArgs', joined, scope);
-			logger.output(`${icons.info} Migrated rocketride.engineArgs from array to string (${scope === vscode.ConfigurationTarget.Global ? 'global' : 'workspace'})`);
-		}
-	};
-	if (engineArgs?.globalValue !== undefined) await migrateArgs(vscode.ConfigurationTarget.Global, engineArgs.globalValue);
-	if (engineArgs?.workspaceValue !== undefined) await migrateArgs(vscode.ConfigurationTarget.Workspace, engineArgs.workspaceValue);
 
 	// Migration 2: Remove old engine directory from extensionPath (v1.0.0 stored engine inside the extension folder)
 	const oldEngineDir = path.join(context.extensionPath, 'engine');
@@ -106,17 +103,11 @@ async function runMigrations(context: vscode.ExtensionContext): Promise<void> {
 			// Development
 			['connectionMode', 'development.connectionMode'],
 			['hostUrl', 'development.hostUrl'],
-			['developmentTeamId', 'development.teamId'],
 			['local.engineVersion', 'development.local.engineVersion'],
-			['local.debugOutput', 'development.local.debugOutput'],
-			['engineArgs', 'development.local.engineArgs'],
 			// Deployment
 			['deployTargetMode', 'deployment.connectionMode'],
 			['deployHostUrl', 'deployment.hostUrl'],
-			['deployTargetTeamId', 'deployment.teamId'],
 			['deploy.local.engineVersion', 'deployment.local.engineVersion'],
-			['deploy.local.debugOutput', 'deployment.local.debugOutput'],
-			['deployEngineArgs', 'deployment.local.engineArgs'],
 		];
 
 		for (const [oldKey, newKey] of keyMap) {
@@ -160,6 +151,41 @@ async function runMigrations(context: vscode.ExtensionContext): Promise<void> {
 		logger.output(`${icons.success} Migrated settings to development/deployment groups`);
 	}
 
+	// Migration 3b: legacy per-connection debug-output flags fold into the ONE
+	// per-task setting — any scope that had debug output on keeps it on (OR of
+	// the old keys; same intent, wider scope). Own marker: the V2 migration
+	// shipped earlier, so users who already completed it must still get this
+	// one. engineArgs is deliberately NOT migrated: engine PROCESS flags are
+	// not per-task arguments, and silently injecting them into every .use call
+	// could break runs.
+	if (!context.globalState.get('debugOutputMigrationDone')) {
+		const legacyDebugKeys = ['local.debugOutput', 'deploy.local.debugOutput', 'development.local.debugOutput', 'deployment.local.debugOutput'];
+		for (const target of [vscode.ConfigurationTarget.Global, vscode.ConfigurationTarget.Workspace] as const) {
+			const scope = target === vscode.ConfigurationTarget.Global ? 'globalValue' : 'workspaceValue';
+			let anyOn = false;
+			let anySet = false;
+			for (const key of legacyDebugKeys) {
+				const value = config.inspect<unknown>(key)?.[scope];
+				if (value !== undefined) {
+					anySet = true;
+					if (value === true) anyOn = true;
+				}
+			}
+			// Write the replacement BEFORE deleting anything: a failure mid-way
+			// must never have destroyed the only copy of the old configuration
+			// (the whole migration is retry-safe in that order).
+			if (anySet && anyOn && config.inspect<unknown>('pipelineDebugOutput')?.[scope] === undefined) {
+				await config.update('pipelineDebugOutput', true, target);
+			}
+			for (const key of legacyDebugKeys) {
+				if (config.inspect<unknown>(key)?.[scope] !== undefined) {
+					await config.update(key, undefined, target);
+				}
+			}
+		}
+		await context.globalState.update('debugOutputMigrationDone', true);
+	}
+
 	// Migration 4: Move local engine from globalStorage to per-user dir
 	// Old: globalStorage/engines/server-3.2.0--abc/engine.exe + pointer files
 	// New: %LOCALAPPDATA%/RocketRide/engine/engine.exe + version.json
@@ -178,6 +204,7 @@ async function runMigrations(context: vscode.ExtensionContext): Promise<void> {
  * @param context VS Code extension context
  */
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+	extensionContext = context;
 	const logger = getLogger();
 	logger.output(`${icons.begin} Activating RocketRide extension...`);
 
@@ -267,11 +294,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 				// deploy removed — register redirect command so sidebar "Deploy" opens Settings
 				context.subscriptions.push(vscode.commands.registerCommand('rocketride.page.deploy.open', () => vscode.commands.executeCommand('rocketride.page.settings.open', 'deployment')));
 				status = new StatusProvider(context);
+				// App Builder — a first-class DOCUMENT, .pipe-style: a custom
+				// editor over the app's real <name>.rrapp file (VSCode owns tab
+				// identity, dedupe, and restore-on-reload; double-clicking the
+				// file in the Explorer opens the App Builder), plus the
+				// watch-session manager driving the inner loop.
+				appScreen = new AppScreenProvider(context);
+				const watchManager = initWatchManager(appScreen);
+				context.subscriptions.push(
+					vscode.window.registerCustomEditorProvider('rocketride.appBuilder', appScreen, {
+						webviewOptions: { retainContextWhenHidden: true },
+						supportsMultipleEditorsPerDocument: false,
+					}),
+					appScreen,
+					{ dispose: () => watchManager.dispose() },
+				);
+				// File-less per-team deployment tabs (teams-as-environments)
 				welcome = new WelcomeProvider(context, context.extensionUri);
 				const account = new AccountProvider(context);
 				const environment = new EnvironmentProvider(context);
-				const auth = new AuthProvider(context, context.extensionUri);
-				context.subscriptions.push(account, environment, auth);
+				// New App wizard — registers rocketride.app.create itself
+				const newApp = new NewAppProvider(context);
+				context.subscriptions.push(account, environment, newApp);
 
 				// Register unified project editor (canvas + status + trace)
 				project = new ProjectProvider(context);
@@ -385,6 +429,34 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * Creates a brand-new, NAMELESS untitled pipeline document and opens it in the
+ * pipeline grid editor — the standard VS Code new-file lifecycle, shared by the
+ * sidebar "New pipeline" action and the File ▸ New File… picker.
+ *
+ * The document is deliberately path-less. A path-bearing untitled URI is
+ * treated by VS Code as already destined for that file, so it silent-saves with
+ * no dialog (and errors "file already exists" when the file is present). A
+ * nameless untitled defers everything to first save, which is handled by the
+ * scoped Ctrl+S keybinding / webview Save button → {@link savePipelineDocument}.
+ */
+async function createUntitledPipeline(): Promise<void> {
+	// step: require an open workspace — pipelines are rooted in it.
+	if (!vscode.workspace.workspaceFolders?.length) {
+		vscode.window.showErrorMessage('No workspace folder open');
+		return;
+	}
+
+	try {
+		// step: open a NAMELESS untitled document seeded with the empty-pipeline
+		// template (born dirty), then show it in the pipeline grid editor.
+		const doc = await vscode.workspace.openTextDocument({ language: 'json', content: JSON.stringify({ components: [] }, null, 2) });
+		await vscode.commands.executeCommand('vscode.openWith', doc.uri, 'rocketride.PageProject');
+	} catch (error) {
+		vscode.window.showErrorMessage(`Failed to create pipeline: ${error}`);
+	}
+}
+
+/**
  * Registers utility commands that coordinate between providers
  */
 function registerUtilityCommands(context: vscode.ExtensionContext): void {
@@ -406,6 +478,13 @@ function registerUtilityCommands(context: vscode.ExtensionContext): void {
 		}),
 		vscode.commands.registerCommand('rocketride.page.status.open', (projectId: string, sourceId: string, displayName: string) => {
 			status?.show(projectId, sourceId, displayName);
+		}),
+		vscode.commands.registerCommand('rocketride.app.open', (appId: string) => {
+			// Fire-and-forget: a rejection has no other surface here — say it.
+			appScreen?.show(appId).catch((err) => vscode.window.showErrorMessage(`Failed to open app: ${err instanceof Error ? err.message : String(err)}`));
+		}),
+		vscode.commands.registerCommand('rocketride.app.debug', (appId: string) => {
+			debugApp(appId).catch((err) => vscode.window.showErrorMessage(`Failed to debug app: ${err instanceof Error ? err.message : String(err)}`));
 		}),
 		vscode.commands.registerCommand('rocketride.refresh', async () => {
 			await refreshAllProviders();
@@ -439,31 +518,31 @@ function registerUtilityCommands(context: vscode.ExtensionContext): void {
 		}),
 
 		// ── Pipeline file commands (previously in SidebarFilesProvider) ──────────
+		// Both entry points — the sidebar "New pipeline" action and the
+		// File ▸ New File… picker — mint a new untitled .pipe through the
+		// standard VS Code document lifecycle (see createUntitledPipeline).
 		vscode.commands.registerCommand('rocketride.sidebar.files.createFile', async () => {
-			if (!vscode.workspace.workspaceFolders) {
-				vscode.window.showErrorMessage('No workspace folder open');
-				return;
-			}
-			const workspaceFolder = vscode.workspace.workspaceFolders[0];
-			const config = ConfigManager.getInstance().getConfig();
-			const rawPath = config?.defaultPipelinePath || 'pipelines';
-			const relativePath = rawPath.replace(/^\$\{workspaceFolder\}[/\\]?/, '');
-			const defaultDir = vscode.Uri.joinPath(workspaceFolder.uri, relativePath);
+			await createUntitledPipeline();
+		}),
 
-			const fileUri = await vscode.window.showSaveDialog({
-				defaultUri: vscode.Uri.joinPath(defaultDir, 'new-pipeline'),
-				filters: { 'RocketRide Pipeline': ['pipe'] },
-				title: 'Create New Pipeline',
-			});
-			if (!fileUri) return;
+		vscode.commands.registerCommand('rocketride.pipeline.new', async () => {
+			await createUntitledPipeline();
+		}),
 
-			await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(fileUri, '..'));
-			const template = { components: [] };
+		// Ctrl+S inside the grid editor (contributes.keybindings, scoped to
+		// activeCustomEditorId): resolve the active custom-editor tab to its
+		// backing document and run the shared save flow — in place for titled
+		// files, the native OS Save dialog (defaulted into the pipelines
+		// directory) for untitled ones.
+		vscode.commands.registerCommand('rocketride.pipeline.save', async () => {
+			const input = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
+			if (!(input instanceof vscode.TabInputCustom) || input.viewType !== 'rocketride.PageProject') return;
+			const document = vscode.workspace.textDocuments.find((d) => d.uri.toString() === input.uri.toString());
+			if (!document) return;
 			try {
-				await vscode.workspace.fs.writeFile(fileUri, Buffer.from(JSON.stringify(template, null, 2), 'utf8'));
-				await vscode.commands.executeCommand('vscode.openWith', fileUri, 'rocketride.PageProject');
+				await savePipelineDocument(document);
 			} catch (error) {
-				vscode.window.showErrorMessage(`Failed to create pipeline: ${error}`);
+				vscode.window.showErrorMessage(`Failed to save pipeline: ${error}`);
 			}
 		}),
 
@@ -601,14 +680,19 @@ export async function deactivate(): Promise<void> {
 /** Cached GitHub releases (engine binaries). Populated by ConnectionMessageHandler.fetchAndBroadcastVersions(). */
 export let cachedEngineVersions: Array<{ tag_name: string; prerelease: boolean }> = [];
 /** Replaces the cached engine version list. Called by ConnectionMessageHandler after a successful GitHub API fetch. */
-export const setCachedEngineVersions = (v: typeof cachedEngineVersions) => { cachedEngineVersions = v; };
+export const setCachedEngineVersions = (v: typeof cachedEngineVersions) => {
+	cachedEngineVersions = v;
+};
 
 /** Cached GHCR container tags (Docker images). Populated by ConnectionMessageHandler.fetchAndBroadcastDockerTags(). */
 export let cachedDockerTags: string[] = [];
 /** Replaces the cached Docker tag list. Called by ConnectionMessageHandler after a successful GHCR API fetch. */
-export const setCachedDockerTags = (t: string[]) => { cachedDockerTags = t; };
+export const setCachedDockerTags = (t: string[]) => {
+	cachedDockerTags = t;
+};
 
 // Export getters for provider access
+export const getExtensionContext = () => extensionContext;
 export const getConnectionManager = () => connectionManager;
 export const getEngineRegistry = () => engineRegistry;
 export const getSettingsProvider = () => settings;
